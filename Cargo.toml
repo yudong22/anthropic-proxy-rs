@@ -2,18 +2,26 @@
 name = "anthropic-proxy"
 version = "1.2.0"
 edition = "2021"
-authors = ["m0n0x41d <zakutnii.ivan@gmail.com>"]
+authors = [
+    "yudong22 (孙东) <3cking@163.com>",
+    "m0n0x41d (Ivan Zakutnii) <zakutnii.ivan@gmail.com>",
+]
 description = "High-performance Anthropic API proxy to OpenAI-compatible endpoints"
 license = "MIT"
-repository = "https://github.com/m0n0x41d/anthropic-proxy-rs"
+repository = "https://github.com/yudong22/anthropic-proxy-rs"
 
-[[bin]]
-name = "anthropic-proxy"
-path = "src/main.rs"
+[lib]
+name = "anthropic_proxy"
+path = "src/lib.rs"
+
+[workspace]
+members = [
+    "src-tauri",
+]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync", "net"] }
 
 # Web framework
 axum = { version = "0.7", features = ["http2"] }
@@ -27,11 +35,10 @@ serde_json = "1.0"
 
 # Async utilities
 futures = "0.3"
-tokio-stream = "0.1"
+async-stream = "0.3"
 
 # Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
@@ -39,28 +46,22 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 anyhow = "1.0"
 thiserror = "2.0"
 
+# Substring/line sanitization of outbound request bodies (port of Go sanitize.go
+# rewrite table so fingerprints in user/assistant/tool content and reasoning are
+# neutralized before they reach the upstream content filter).
+regex = "1"
+
 # Environment variables
 dotenvy = "0.15"
 
-# CLI argument parsing
-clap = { version = "4.5", features = ["derive"] }
-
-# Daemonize
-daemonize = "0.5"
-
 # Server utilities
-tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Async streams
-async-stream = "0.3"
 bytes = "1.9"
-pin-project = "1.1"
 
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
-pkg-fmt = "tgz"
-bin-dir = "{ bin }"
+# SQLite persistence for daily statistics
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 opt-level = "z"        # Optimize for size

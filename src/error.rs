@@ -8,7 +8,6 @@ use thiserror::Error;
 
 /// Application-specific errors
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub enum ProxyError {
     #[error("Configuration error: {0}")]
     Config(String),
@@ -24,9 +23,6 @@ pub enum ProxyError {
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-
-    #[error("Internal error: {0}")]
-    Internal(String),
 }
 
 impl IntoResponse for ProxyError {
@@ -39,7 +35,6 @@ impl IntoResponse for ProxyError {
                 (StatusCode::BAD_REQUEST, format!("JSON error: {}", err))
             }
             ProxyError::Http(err) => (StatusCode::BAD_GATEWAY, format!("HTTP error: {}", err)),
-            ProxyError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
         let body = Json(json!({
@@ -87,14 +82,6 @@ mod tests {
         assert_eq!(
             status_of(ProxyError::Upstream("bad".into())),
             StatusCode::BAD_GATEWAY
-        );
-    }
-
-    #[test]
-    fn internal_error_returns_500() {
-        assert_eq!(
-            status_of(ProxyError::Internal("bad".into())),
-            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

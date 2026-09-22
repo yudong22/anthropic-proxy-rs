@@ -1,6 +1,38 @@
+use crate::settings::{GuiSettings, DEFAULT_PORT};
 use anyhow::{bail, Result};
 use reqwest::Url;
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
+
+/// Trimmed, non-empty environment variable, if set.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Truthy environment flag (`1` or `true`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Environment variable parsed as a port number.
+fn env_u16(name: &str) -> Option<u16> {
+    non_empty_env(name).and_then(|v| v.parse().ok())
+}
+
+/// How a provider exposes its model catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ModelsFlavor {
+    /// Standard OpenAI `GET {base}/v1/models` returning `{"data":[{"id":…}]}`.
+    #[default]
+    OpenAI,
+    /// Vendor-specific config endpoint (WorkBuddy `/v3/config`) whose models
+    /// must be filtered by `agents[name=cli].models`.
+    WorkBuddyConfig,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -15,12 +47,21 @@ pub struct Config {
     pub completion_model: Option<String>,
     pub debug: bool,
     pub verbose: bool,
+    /// Vendor models endpoint, e.g. `https://copilot.tencent.com/v3/config`.
+    pub models_config_url: Option<String>,
+    pub models_flavor: ModelsFlavor,
+    /// When true (WorkBuddy/CodeBuddy flavor), neutralize upstream content-filter
+    /// fingerprints across every outbound message field. See pipeline.rs.
+    pub sanitize_fingerprints: bool,
+    /// Optional gateway wallet-balance endpoint for `GET /v1/credits`.
+    /// When unset, the WorkBuddy flavor auto-uses its billing resource endpoint.
+    pub credits_endpoint: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            port: 3000,
+            port: 3456,
             bind: "0.0.0.0".to_string(),
             upstream_urls: vec!["http://localhost:11434".to_string()],
             api_key: None,
@@ -31,113 +72,138 @@ impl Default for Config {
             completion_model: None,
             debug: false,
             verbose: false,
+            models_config_url: None,
+            models_flavor: ModelsFlavor::OpenAI,
+            credits_endpoint: None,
+            sanitize_fingerprints: false,
         }
     }
 }
 
 impl Config {
-    fn load_dotenv(custom_path: Option<PathBuf>) -> Option<PathBuf> {
-        if let Some(path) = custom_path {
-            if path.exists() && dotenvy::from_path(&path).is_ok() {
-                return Some(path);
-            }
-            eprintln!(
-                "⚠️  WARNING: Custom config file not found: {}",
-                path.display()
-            );
-        }
+    /// Build the proxy configuration from persisted settings.
+    ///
+    /// `gui-settings.json` is the source of truth for the upstream endpoint,
+    /// credentials, bind address and model overrides. Environment variables and
+    /// a `.env` file may then override any of those fields, so an app launched
+    /// from a configured shell (or an existing `.env` setup) keeps behaving as
+    /// documented. This is the single construction path for the app.
+    pub fn from_settings(settings: &GuiSettings) -> Result<Self> {
+        Self::load_dotenv();
 
-        if let Ok(path) = dotenvy::dotenv() {
-            return Some(path);
-        }
+        let chat_url = settings.chat_url(&crate::providers::builtin_presets());
+        let upstream_urls = Self::parse_upstream_urls(&chat_url)?;
 
-        if let Ok(home) = env::var("HOME") {
-            let home_config = PathBuf::from(home).join(".anthropic-proxy.env");
-            if home_config.exists() && dotenvy::from_path(&home_config).is_ok() {
-                return Some(home_config);
-            }
-        }
-
-        let etc_config = PathBuf::from("/etc/anthropic-proxy/.env");
-        if etc_config.exists() && dotenvy::from_path(&etc_config).is_ok() {
-            return Some(etc_config);
-        }
-
-        None
-    }
-
-    #[allow(dead_code)]
-    pub fn from_env() -> Result<Self> {
-        Self::from_env_with_path(None)
-    }
-
-    pub fn from_env_with_path(custom_path: Option<PathBuf>) -> Result<Self> {
-        if let Some(path) = Self::load_dotenv(custom_path) {
-            eprintln!("📄 Loaded config from: {}", path.display());
+        let preset = settings.models_preset();
+        let models_flavor = if preset.models_config_url.is_some() {
+            ModelsFlavor::WorkBuddyConfig
         } else {
-            eprintln!("ℹ️  No .env file found, using environment variables only");
+            ModelsFlavor::OpenAI
+        };
+        let sanitize_fingerprints = models_flavor == ModelsFlavor::WorkBuddyConfig;
+
+        let mut model_map = if settings.model_map.trim().is_empty() {
+            BTreeMap::new()
+        } else {
+            Self::parse_model_map(&settings.model_map)?
+        };
+        if let Some(raw_map) = non_empty_env("ANTHROPIC_PROXY_MODEL_MAP") {
+            model_map.extend(Self::parse_model_map(&raw_map)?);
         }
 
-        let port = env::var("PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(3000);
+        let mut config = Config {
+            port: env_u16("PORT").unwrap_or(if settings.port == 0 {
+                DEFAULT_PORT
+            } else {
+                settings.port
+            }),
+            bind: non_empty_env("ANTHROPIC_PROXY_BIND").unwrap_or_else(|| {
+                if settings.bind.trim().is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    settings.bind.trim().to_string()
+                }
+            }),
+            upstream_urls,
+            api_key: Some(settings.api_key.trim().to_string()).filter(|k| !k.is_empty()),
+            reasoning_model: Some(settings.reasoning_model.trim().to_string())
+                .filter(|m| !m.is_empty()),
+            completion_model: Some(settings.completion_model.trim().to_string())
+                .filter(|m| !m.is_empty()),
+            model_map,
+            models_config_url: preset.models_config_url,
+            models_flavor,
+            sanitize_fingerprints,
+            ..Default::default()
+        };
 
-        let bind = env::var("ANTHROPIC_PROXY_BIND")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "0.0.0.0".to_string());
+        // GUI-exposed fingerprint word list (semicolon/newline separated). Mirrors
+        // the ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS env var but editable from
+        // the console without a restart. Both the system-prompt scrub and the
+        // full-message sanitizer consume this list.
+        let gui_terms = Self::parse_system_prompt_ignore_terms(&settings.sanitize_terms);
+        if !gui_terms.is_empty() {
+            config.system_prompt_ignore_terms = gui_terms;
+        }
 
-        let raw_urls = env::var("UPSTREAM_BASE_URL")
-            .or_else(|_| env::var("ANTHROPIC_PROXY_BASE_URL"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "UPSTREAM_BASE_URL is required. Set it to your OpenAI-compatible endpoint.\n\
-                Examples:\n\
-                  - OpenRouter: https://openrouter.ai/api\n\
-                  - OpenAI: https://api.openai.com\n\
-                  - Multiple (failover): https://openrouter.ai/api;https://api.openai.com\n\
-                  - Local: http://localhost:11434"
-                )
-            })?;
+        config.apply_env_overrides()?;
+        Ok(config)
+    }
 
-        let upstream_urls = Self::parse_upstream_urls(&raw_urls)?;
+    /// Load a `.env` file, first found wins. Mirrors the documented search
+    /// order: `./.env`, then the per-user data dir, then legacy locations.
+    fn load_dotenv() {
+        if dotenvy::dotenv().is_ok() {
+            return;
+        }
+        let mut candidates = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(&home).join(".proxy-rs").join(".env"));
+            candidates.push(PathBuf::from(home).join(".anthropic-proxy.env"));
+        }
+        candidates.push(PathBuf::from("/etc/anthropic-proxy/.env"));
 
-        let api_key = env::var("UPSTREAM_API_KEY")
-            .or_else(|_| env::var("OPENROUTER_API_KEY"))
-            .ok()
-            .filter(|k| !k.is_empty());
+        for path in candidates {
+            if path.exists() && dotenvy::from_path(&path).is_ok() {
+                return;
+            }
+        }
+    }
 
-        let model_map = env::var("ANTHROPIC_PROXY_MODEL_MAP")
-            .ok()
-            .map(|value| Self::parse_model_map(&value))
-            .transpose()?
-            .unwrap_or_default();
+    /// Apply the documented environment variables on top of the settings.
+    fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(raw_urls) =
+            non_empty_env("UPSTREAM_BASE_URL").or_else(|| non_empty_env("ANTHROPIC_PROXY_BASE_URL"))
+        {
+            self.upstream_urls = Self::parse_upstream_urls(&raw_urls)?;
+        }
 
-        let mut system_prompt_ignore_terms = env::var("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS")
-            .ok()
-            .map(|value| Self::parse_system_prompt_ignore_terms(&value))
-            .unwrap_or_default();
-        Self::dedupe_ignore_terms(&mut system_prompt_ignore_terms);
+        if let Some(key) =
+            non_empty_env("UPSTREAM_API_KEY").or_else(|| non_empty_env("OPENROUTER_API_KEY"))
+        {
+            self.api_key = Some(key);
+        }
+        if let Some(model) = non_empty_env("REASONING_MODEL") {
+            self.reasoning_model = Some(model);
+        }
+        if let Some(model) = non_empty_env("COMPLETION_MODEL") {
+            self.completion_model = Some(model);
+        }
+        if let Some(endpoint) = non_empty_env("CREDITS_API_ENDPOINT") {
+            self.credits_endpoint = Some(endpoint);
+        }
 
-        let reasoning_model = env::var("REASONING_MODEL").ok();
-        let completion_model = env::var("COMPLETION_MODEL").ok();
+        if let Some(terms) = non_empty_env("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS") {
+            self.system_prompt_ignore_terms = Self::parse_system_prompt_ignore_terms(&terms);
+            Self::dedupe_ignore_terms(&mut self.system_prompt_ignore_terms);
+        }
 
-        let debug = env::var("DEBUG")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+        self.passthrough_api_key = env_flag("UPSTREAM_API_KEY_PASSTHROUGH");
+        self.debug = env_flag("DEBUG");
+        self.verbose = env_flag("VERBOSE");
 
-        let verbose = env::var("VERBOSE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        let passthrough_api_key = env::var("UPSTREAM_API_KEY_PASSTHROUGH")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
-        if passthrough_api_key && api_key.is_some() {
+        // Passthrough extracts the key per request, so a static key contradicts it.
+        if self.passthrough_api_key && self.api_key.is_some() {
             bail!(
                 "UPSTREAM_API_KEY_PASSTHROUGH=true cannot be used together with UPSTREAM_API_KEY.\n\
                  When passthrough is enabled, the API key is extracted from each incoming request's x-api-key header.\n\
@@ -145,19 +211,7 @@ impl Config {
             );
         }
 
-        Ok(Config {
-            port,
-            bind,
-            upstream_urls,
-            api_key,
-            passthrough_api_key,
-            model_map,
-            system_prompt_ignore_terms,
-            reasoning_model,
-            completion_model,
-            debug,
-            verbose,
-        })
+        Ok(())
     }
 
     pub fn chat_completions_urls(&self) -> Vec<String> {
@@ -180,7 +234,7 @@ impl Config {
             .collect()
     }
 
-    fn parse_upstream_urls(raw: &str) -> Result<Vec<String>> {
+    pub fn parse_upstream_urls(raw: &str) -> Result<Vec<String>> {
         let urls: Vec<String> = raw
             .split(';')
             .map(str::trim)

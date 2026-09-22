@@ -2,33 +2,25 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["*"]
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: anthropic-proxy
 
 jobs:
-  build:
+  build-tauri:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            cross: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_name: macos-x86_64
 
     runs-on: ${{ matrix.os }}
 
@@ -41,36 +33,26 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-tauri
 
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
 
-      - name: Build
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }}
-          else
-            cargo build --release --locked --target ${{ matrix.target }}
-          fi
+      - name: Install Tauri CLI
+        run: npm ci
 
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
-          cd ../../..
-          shasum -a 256 ${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz > ${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz.sha256
+      - name: Build desktop app and installer
+        run: npm run build:dmg -- --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
-          path: |
-            ${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz
-            ${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz.sha256
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
   release:
-    needs: build
+    needs: [build-tauri]
     runs-on: ubuntu-latest
 
     steps:
@@ -91,7 +73,7 @@ jobs:
             artifacts/*
 
   publish:
-    needs: build
+    needs: [build-tauri]
     runs-on: ubuntu-latest
 
     steps:
@@ -99,45 +81,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish to crates.io
+      - name: Publish library to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
-
-  docker:
-    needs: build
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: cargo publish --locked -p anthropic-proxy

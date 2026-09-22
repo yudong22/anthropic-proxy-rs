@@ -22,6 +22,8 @@ pub struct OpenAIRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,14 +45,14 @@ pub struct Message {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
@@ -59,7 +61,7 @@ pub enum ContentPart {
     ImageUrl { image_url: ImageUrl },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
 }
@@ -105,6 +107,7 @@ pub struct OpenAIResponse {
     #[serde(default)]
     pub model: Option<String>,
     pub choices: Vec<Choice>,
+    #[serde(default)]
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
@@ -127,11 +130,69 @@ pub struct ChoiceMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// OpenAI-compatible breakout of cached prompt tokens, if the upstream
+    /// reports it. Mapped to Anthropic `cache_read_input_tokens`.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Some providers report cache breakouts at the top level.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
+    /// DeepSeek official format: prompt_cache_hit_tokens
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// DeepSeek official format: prompt_cache_miss_tokens
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u32>,
+    /// Top-level cached_tokens reported by some providers
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+impl Usage {
+    pub fn cache_read_tokens(&self) -> i64 {
+        self.cache_read_input_tokens
+            .or(self.prompt_cache_hit_tokens)
+            .or(self.cached_tokens)
+            .or_else(|| self.prompt_tokens_details.as_ref().map(|d| d.cached_tokens))
+            .unwrap_or(0) as i64
+    }
+
+    pub fn cache_write_tokens(&self) -> i64 {
+        self.cache_creation_input_tokens.unwrap_or(0) as i64
+    }
+
+    pub fn uncached_input_tokens(&self) -> i64 {
+        let read = self.cache_read_tokens();
+        let write = self.cache_write_tokens();
+        (self.prompt_tokens as i64)
+            .saturating_sub(read)
+            .saturating_sub(write)
+            .max(0)
+    }
+
+    pub fn to_token_record(&self) -> crate::stats::TokenRecord {
+        crate::stats::TokenRecord {
+            input: self.uncached_input_tokens(),
+            cache_read: self.cache_read_tokens(),
+            cache_write: self.cache_write_tokens(),
+            output: self.completion_tokens as i64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
+    #[serde(default)]
+    pub audio_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +224,7 @@ pub struct StreamChunk {
     pub created: Option<u64>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,

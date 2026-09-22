@@ -121,16 +121,17 @@ translate_error(message: String) -> Vec<anthropic::StreamEvent>
 
 ## LAYER 3: I/O Shell
 
-**Module:** `src/proxy.rs`, `src/config.rs`, `src/cli.rs`, `src/main.rs`
+**Module:** `src/proxy.rs`, `src/config.rs`, `src/service.rs`, `src/router.rs`, `src-tauri/src/main.rs`
 
-**Concepts:** Side effects. HTTP server/client, SSE byte framing, configuration loading, logging, daemon management.
+**Concepts:** Side effects. HTTP server/client, SSE byte framing, configuration loading, logging, app/daemon lifecycle.
 
 **Functions:**
 ```
 proxy_handler(config, client, request) -> Response
 list_models_handler(config, client) -> Response
-parse_sse_frames(&mut buffer, &[u8]) -> Vec<String>
-serialize_event(&StreamEvent) -> Bytes
+forward_request(...) -> Response
+create_flavor_sse_stream(...) -> impl Stream
+serialize_sse_event(&str, &T) -> String
 ```
 
 **Inexpressible:** Business logic. Handlers call pure functions and pipe data.
@@ -143,47 +144,58 @@ Streaming request trace:
 
 ```
 proxy_handler(req)                                        [Layer 3: I/O]
-  → policy = TranslationPolicy::from(&config)             [Layer 2a]
+  → policy = translation_policy(&config)                  [Layer 2a]
   → openai_req = translate_request(req, &policy)          [Layer 2a]
       → model = select_model(req, &policy)                [Layer 2a: routing]
       → messages = translate_message(msg) for each        [Layer 1: atom]
       → tools = translate_tool(t) for each                [Layer 1: atom]
       → system = sanitize(system, &policy.ignore_terms)   [Layer 1: atom + Layer 2a]
-  → upstream_stream = client.post(url).send()             [Layer 3: I/O]
-  → state = initial_state(model)                          [Layer 2b]
-  → for each raw_bytes:                                   [Layer 3: I/O]
-      → frames = parse_sse_frames(&mut buffer, &bytes)    [Layer 3: wire protocol]
-      → for each frame:
-          chunk = deserialize(frame)                      [Layer 3: serde]
-          events = translate_chunk(&mut state, &chunk)    [Layer 2b: pure]
-          bytes = events.map(serialize_event)             [Layer 3: wire protocol]
-          yield bytes                                     [Layer 3: I/O]
+  → forward_request(config, client, openai_req, ...)      [Layer 3: I/O]
+      → upstream = client.post(url).send()                [Layer 3: I/O]
+      → create_flavor_sse_stream(upstream, flavor)        [Layer 3: wire protocol]
+          → frames = split on "\n\n"                      [Layer 3: wire protocol]
+          → chunk = deserialize(frame)                    [Layer 3: serde]
+          → events = translate_chunk(&mut state, &chunk)  [Layer 2b: pure]
+          → bytes = serialize_sse_event(event_type, event) [Layer 3: wire protocol]
+          → yield bytes                                   [Layer 3: I/O]
 ```
 
 ## Module Layout
 
 ```
-src/
+src/                    ← the `anthropic_proxy` library (proxy core)
   models/
     mod.rs
-    anthropic.rs    ← Layer 0
-    openai.rs       ← Layer 0
+    anthropic.rs        ← Layer 0
+    openai.rs           ← Layer 0
+    responses.rs        ← Layer 0
   translate/
-    mod.rs          ← re-exports
-    core.rs         ← Layer 1
-    pipeline.rs     ← Layer 2a
-    stream.rs       ← Layer 2b
-  proxy.rs          ← Layer 3: HTTP handlers
-  config.rs         ← Layer 3: config loading
-  cli.rs            ← Layer 3: CLI parsing
-  main.rs           ← Layer 3: wiring
-  error.rs          ← cross-cutting
+    mod.rs              ← re-exports
+    core.rs             ← Layer 1
+    pipeline.rs         ← Layer 2a
+    stream.rs           ← Layer 2b
+    responses.rs        ← Layer 2b (Responses API)
+  proxy.rs              ← Layer 3: HTTP handlers
+  router.rs             ← Layer 3: route table (single source of truth)
+  service.rs            ← Layer 3: service lifecycle handle
+  config.rs             ← Layer 3: config loading (+ env overlay)
+  settings.rs           ← Layer 3: persisted settings, logs
+  stats.rs              ← Layer 3: SQLite daily stats
+  credits.rs            ← Layer 3: gateway wallet balance
+  providers.rs          ← Layer 3: provider presets / models discovery
+  util.rs               ← cross-cutting helpers (truncate, dates, headers)
+  error.rs              ← cross-cutting
+
+src-tauri/src/main.rs   ← desktop app: Tauri commands + tray (uses the library)
 ```
 
 ## Invariants
 
 1. Layers 1, 2a, 2b contain NO I/O, NO async, NO logging
 2. Layer 3 contains NO business logic — only wiring
-3. translate/ modules never import from proxy.rs, config.rs, cli.rs, or main.rs
+3. translate/ modules never import from proxy.rs, config.rs, router.rs, or settings.rs
 4. proxy.rs never constructs Anthropic StreamEvents directly — only via translate/stream.rs
 5. All state in translate/ is passed explicitly — no globals, no Arc, no hidden dependencies
+6. Every route is registered exactly once, in `router.rs`
+7. The proxy core is a library; the desktop app is its only front-end and must
+   build its `Config` via `Config::from_settings`

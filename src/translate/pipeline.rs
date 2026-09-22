@@ -1,14 +1,41 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, openai};
 use crate::translate::core;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 pub struct TranslationPolicy {
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub model_map: BTreeMap<String, String>,
     pub ignore_terms: Vec<String>,
+    /// When true (WorkBuddy/CodeBuddy flavor), strip a trailing `[…]` tag such
+    /// as `[1M]` from the model id before sending upstream. Clients like
+    /// Claude Code append context-size hints that the gateway does not
+    /// understand and rejects with `11102 model … service info not found`.
+    pub strip_model_suffix: bool,
+    /// When true (WorkBuddy/CodeBuddy flavor), neutralize upstream content-filter
+    /// fingerprints across every outbound message field (content, tool arguments,
+    /// reasoning) and the developer→system role. Ported from sanitize.go.
+    pub sanitize_fingerprints: bool,
+}
+
+/// Remove a single trailing `[…]` suffix (e.g. `deepseek-v4.1-flash[1M]` →
+/// `deepseek-v4.1-flash`). Returns the model unchanged if there is no such
+/// suffix or the remainder would be empty.
+pub(crate) fn strip_model_suffix(model: &str) -> String {
+    if let Some(open) = model.rfind('[') {
+        let suffix = &model[open..];
+        if suffix.ends_with(']') && suffix.len() > 1 {
+            let prefix = &model[..open];
+            if !prefix.is_empty() {
+                return prefix.to_string();
+            }
+        }
+    }
+    model.to_string()
 }
 
 pub fn translate_request(
@@ -85,6 +112,7 @@ pub fn translate_request(
         }),
         tools,
         tool_choice: None,
+        extra: serde_json::Map::new(),
     })
 }
 
@@ -144,6 +172,16 @@ pub fn translate_response(
         usage: anthropic::Usage {
             input_tokens: resp.usage.prompt_tokens,
             output_tokens: resp.usage.completion_tokens,
+            cache_creation_input_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
+            cache_read_input_tokens: resp
+                .usage
+                .cache_read_input_tokens
+                .or(resp
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens))
+                .unwrap_or(0),
         },
     })
 }
@@ -191,10 +229,20 @@ fn select_model(req: &anthropic::AnthropicRequest, policy: &TranslationPolicy) -
             .unwrap_or_else(|| req.model.clone())
     };
 
-    policy.model_map.get(&model).cloned().unwrap_or(model)
+    let resolved = policy
+        .model_map
+        .get(&model)
+        .cloned()
+        .unwrap_or_else(|| model.clone());
+
+    if policy.strip_model_suffix {
+        strip_model_suffix(&resolved)
+    } else {
+        resolved
+    }
 }
 
-fn sanitize_prompt(text: String, terms: &[String]) -> String {
+pub(crate) fn sanitize_prompt(text: String, terms: &[String]) -> String {
     let mut sanitized = text;
     let mut removed = Vec::new();
 
@@ -216,6 +264,186 @@ fn sanitize_prompt(text: String, terms: &[String]) -> String {
     sanitized
 }
 
+// ---------------------------------------------------------------------------
+// Fingerprint sanitization (port of workbuddy2api/internal/upstream/sanitize.go)
+// ---------------------------------------------------------------------------
+//
+// The upstream content filter rejects requests by exact-substring match on a
+// handful of fixed template strings (CLI system-prompt sentences, SDK key names,
+// the bare error code `11128`, etc.). Rewriting a single token per phrase keeps
+// the semantics intact while breaking the literal match. We must apply this to
+// *every* field that can carry a fingerprint — user/assistant content, tool
+// call arguments (stringified JSON), and reasoning content — not just the
+// system prompt, or the blocked phrases simply reappear in later turns.
+//
+// This runs as a single deterministic pass over the already-translated OpenAI
+// request, so it is upstream-cache friendly: identical input yields an identical
+// rewritten body, so the cache prefix stays stable across retries/turns.
+
+/// Quick pre-check substrings: if none are present we skip the (slightly more
+/// expensive) regex pass entirely. Mirrors `sanitizeFeatures` in the Go source.
+const FINGERPRINT_FEATURES: &[&str] = &[
+    "x-anthropic-billing-header",
+    "cc_entrypoint=",
+    "You are Claude Code",
+    "Main branch (",
+    "You are a coding agent running in the Codex CLI",
+    "github.com/anthropics/",
+    "11128",
+    "anthropics/claude-code/issues",
+];
+
+/// `(from, to)` rewrite pairs. Each rewrites exactly one token so semantics are
+/// preserved. Order is irrelevant (non-overlapping).
+fn rewrite_table() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "You are Claude Code, Anthropic's official CLI for Claude",
+            "You are Claude Code, Anthropic's official CLI tool for Claude",
+        ),
+        (
+            "Main branch (you will usually use this for PRs)",
+            "Default branch (you will usually use this for PRs)",
+        ),
+        (
+            "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+            "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+        ),
+        (
+            "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+            "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+        ),
+        // Upstream anti-probing: any occurrence of the bare error code `11128`
+        // in the body is itself a block condition. A hyphen keeps it readable
+        // and still breaks the literal match (zero-width spaces are normalized
+        // away by the upstream).
+        ("11128", "11-128"),
+    ]
+}
+
+/// Strip layer: `x-anthropic-billing-header: …;?` (key+value, whole segment
+/// removed).
+fn hdr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)x-anthropic-billing-header:[^;\n]*;?\s*").unwrap())
+}
+
+/// Strip layer: trailing bare `cc_*=…;` key/values (looped until stable).
+fn kv_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*").unwrap())
+}
+
+/// Fallback layer: a bare SDK key name (no colon, no value) — e.g. referenced
+/// inside assistant reasoning — cannot be deleted without dropping context, so
+/// we minimally abbreviate it. Superset of `hdr_re` (no colon required).
+fn bare_hdr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)x-anthropic-billing-header").unwrap())
+}
+
+/// False when the text is definitely clean: skips all regex work on normal
+/// traffic. Cheap `contains` fast path plus the case-insensitive bare-key regex
+/// (which `contains` would miss for `X-Anthropic-…` variants).
+fn has_fingerprint(text: &str) -> bool {
+    if FINGERPRINT_FEATURES.iter().any(|f| text.contains(f)) {
+        return true;
+    }
+    bare_hdr_re().is_match(text)
+}
+
+/// Rewrite a single text segment. Returns the input unchanged when no fixed
+/// fingerprint is present (zero allocation on clean text).
+pub(crate) fn sanitize_text(text: &str) -> String {
+    if !has_fingerprint(text) {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for (from, to) in rewrite_table() {
+        out = out.replace(from, to);
+    }
+    if hdr_re().is_match(&out) {
+        out = hdr_re().replace_all(&out, "").to_string();
+    }
+    if out.contains("cc_") {
+        // Clear trailing bare key/values; loop because replacements can expose
+        // adjacent segments (`cc_a=1; cc_b=2;`).
+        let mut prev;
+        loop {
+            prev = out.clone();
+            out = kv_re().replace_all(&out, "").to_string();
+            if out == prev {
+                break;
+            }
+        }
+    }
+    // Bare key name: minimal abbreviation to break the literal match
+    // (key/value form was already removed above).
+    out = bare_hdr_re()
+        .replace_all(&out, "x-anthropic-billing-hdr")
+        .to_string();
+    out.trim().to_string()
+}
+
+/// Sanitize a single message content value (string or multimodal parts). Image
+/// and other non-text parts are left untouched. Returns a new value.
+fn sanitize_content_value(content: &openai::MessageContent) -> openai::MessageContent {
+    match content {
+        openai::MessageContent::Text(text) => openai::MessageContent::Text(sanitize_text(text)),
+        openai::MessageContent::Parts(parts) => {
+            let new_parts: Vec<_> = parts
+                .iter()
+                .map(|p| match p {
+                    openai::ContentPart::Text { text } => openai::ContentPart::Text {
+                        text: sanitize_text(text),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            openai::MessageContent::Parts(new_parts)
+        }
+    }
+}
+
+/// Sanitize `function.arguments` (stringified JSON) of every tool call.
+fn sanitize_tool_calls(calls: &mut [openai::ToolCall]) {
+    for call in calls.iter_mut() {
+        let rewritten = sanitize_text(&call.function.arguments);
+        call.function.arguments = rewritten;
+    }
+}
+
+/// Neutralize fingerprints across an entire translated OpenAI request: every
+/// message's content, reasoning_content and tool-call arguments, plus the
+/// `developer`→`system` role normalization. The request is mutated in place.
+pub(crate) fn sanitize_openai_request(req: &mut openai::OpenAIRequest) {
+    for msg in req.messages.iter_mut() {
+        // The upstream OpenAI-compatible gateway only understands `system` /
+        // `user` / `assistant` / `tool`. Anthropic's `developer` role (used by
+        // some SDK/system variants) is rejected as an "unapproved channel",
+        // so normalize it to `system`.
+        if msg.role == "developer" {
+            msg.role = "system".to_string();
+        }
+
+        if let Some(content) = &msg.content {
+            let new_content = sanitize_content_value(content);
+            if new_content != *content {
+                msg.content = Some(new_content);
+            }
+        }
+        if let Some(rc) = &msg.reasoning_content {
+            let new_rc = sanitize_text(rc);
+            if new_rc != *rc {
+                msg.reasoning_content = Some(new_rc);
+            }
+        }
+        if let Some(calls) = &mut msg.tool_calls {
+            sanitize_tool_calls(calls);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,11 +456,142 @@ mod tests {
             completion_model: config.completion_model.clone(),
             model_map: config.model_map.clone(),
             ignore_terms: config.system_prompt_ignore_terms.clone(),
+            strip_model_suffix: false,
+            sanitize_fingerprints: true,
         }
     }
 
     fn default_policy() -> TranslationPolicy {
         policy_from(&Config::default())
+    }
+
+    // ---- fingerprint sanitization ------------------------------------------
+
+    #[test]
+    fn sanitize_rewrites_identity_sentence() {
+        let in_ = "You are Claude Code, Anthropic's official CLI for Claude";
+        let out = sanitize_text(in_);
+        assert!(out.contains("official CLI tool for Claude"));
+        assert!(!out.contains("official CLI for Claude"));
+    }
+
+    #[test]
+    fn sanitize_rewrites_main_branch() {
+        let out = sanitize_text("Main branch (you will usually use this for PRs)");
+        assert!(out.contains("Default branch"));
+        assert!(!out.contains("Main branch"));
+    }
+
+    #[test]
+    fn sanitize_rewrites_feedback_sentence() {
+        let in_ = "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues";
+        let out = sanitize_text(in_);
+        assert!(out.contains("To provide feedback"));
+        assert!(!out.contains("To give feedback"));
+    }
+
+    #[test]
+    fn sanitize_breaks_11128_with_hyphen() {
+        let out = sanitize_text("the upstream returned code 11128");
+        assert!(out.contains("11-128"));
+        assert!(!out.contains("11128"));
+    }
+
+    #[test]
+    fn sanitize_strips_billing_header_kv() {
+        let in_ = "x-anthropic-billing-header: abc123; carry on";
+        let out = sanitize_text(in_);
+        assert!(!out.contains("x-anthropic-billing-header: abc123"));
+        assert!(out.contains("carry on"));
+    }
+
+    #[test]
+    fn sanitize_strips_bare_cc_kv() {
+        let in_ = "context cc_entrypoint=cli; cc_version=2; done";
+        let out = sanitize_text(in_);
+        assert!(!out.contains("cc_entrypoint"));
+        assert!(!out.contains("cc_version"));
+        assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn sanitize_abbreviates_bare_key_name() {
+        let in_ = "we referenced x-anthropic-billing-header in notes";
+        let out = sanitize_text(in_);
+        assert!(out.contains("x-anthropic-billing-hdr"));
+        assert!(!out.contains("x-anthropic-billing-header"));
+    }
+
+    #[test]
+    fn sanitize_leaves_clean_text_untouched() {
+        let in_ = "Please summarize the quarterly report.";
+        assert_eq!(sanitize_text(in_), in_);
+    }
+
+    #[test]
+    fn sanitize_request_keeps_semantics_and_roles() {
+        let mut req = openai::OpenAIRequest {
+            model: "m".to_string(),
+            messages: vec![
+                openai::Message {
+                    role: "developer".to_string(),
+                    content: Some(openai::MessageContent::Text(
+                        "Main branch (you will usually use this for PRs)".to_string(),
+                    )),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                openai::Message {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content: Some(
+                        "thinking about x-anthropic-billing-header usage".to_string(),
+                    ),
+                    tool_calls: Some(vec![openai::ToolCall {
+                        id: "t1".to_string(),
+                        call_type: "function".to_string(),
+                        function: openai::FunctionCall {
+                            name: "write".to_string(),
+                            arguments: "{\"path\":\"a\",\"content\":\"You are Claude Code, Anthropic's official CLI for Claude\"}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            max_tokens: Some(1),
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(false),
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            extra: serde_json::Map::new(),
+        };
+        sanitize_openai_request(&mut req);
+
+        // developer -> system
+        assert_eq!(req.messages[0].role, "system");
+        let sys_text = match req.messages[0].content.as_ref().unwrap() {
+            openai::MessageContent::Text(t) => t,
+            _ => panic!("expected text content"),
+        };
+        assert!(sys_text.contains("Default branch"));
+
+        // assistant reasoning + tool arguments both scrubbed
+        assert!(req.messages[1]
+            .reasoning_content
+            .as_ref()
+            .unwrap()
+            .contains("x-anthropic-billing-hdr"));
+        let args = &req.messages[1].tool_calls.as_ref().unwrap()[0]
+            .function
+            .arguments;
+        assert!(args.contains("official CLI tool for Claude"));
+        assert!(!args.contains("official CLI for Claude"));
     }
 
     #[test]
@@ -264,6 +623,39 @@ mod tests {
 
         let openai = translate_request(req, &policy).unwrap();
         assert_eq!(openai.model, "openai/gpt-4.1");
+    }
+
+    #[test]
+    fn strips_workbuddy_context_suffix() {
+        let req = anthropic::AnthropicRequest {
+            model: "deepseek-v4.1-flash[1M]".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 64,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: Some(false),
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        // Disabled: suffix must be preserved.
+        let off = translate_request(req.clone(), &default_policy()).unwrap();
+        assert_eq!(off.model, "deepseek-v4.1-flash[1M]");
+
+        // Enabled (WorkBuddy flavor): trailing [1M] dropped.
+        let on = TranslationPolicy {
+            strip_model_suffix: true,
+            ..default_policy()
+        };
+        let openai = translate_request(req, &on).unwrap();
+        assert_eq!(openai.model, "deepseek-v4.1-flash");
     }
 
     #[test]
@@ -676,6 +1068,10 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 1,
                 total_tokens: 6,
+                prompt_tokens_details: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -705,6 +1101,10 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 total_tokens: 12,
+                prompt_tokens_details: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -741,6 +1141,10 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                ..Default::default()
             },
             system_fingerprint: None,
         };

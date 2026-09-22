@@ -1,7 +1,0 @@
-target/
-.git/
-.github/
-.haft/
-specs/
-*.md
-LICENSE

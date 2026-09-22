@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Anthropic Proxy</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect x='32' y='32' width='448' height='448' rx='112' fill='%2317181C'/%3E%3Cpath fill='%23FFF' transform='matrix(1.2 0 0 1.2 148 116)' d='M-8.25 82.5L-8.25 202.5Q-8.3495 205.9585 -5.8336 208.3336Q-3.4585 210.8495 0 210.75Q3.4585 210.8495 5.8336 208.3336Q8.3495 205.9585 8.25 202.5L8.25 82.5Q8.25 67.0547 13.6629 53.9867Q19.0758 40.9188 29.9973 29.9973Q40.9188 19.0759 53.9868 13.6629Q67.0547 8.25 82.5 8.25Q97.9453 8.25 111.0133 13.6629Q124.0812 19.0758 135.0027 29.9973Q145.9241 40.9188 151.3371 53.9868Q156.75 67.0547 156.75 82.5L156.75 202.5Q156.6505 205.9585 159.1664 208.3336Q161.5415 210.8495 165 210.75Q168.4585 210.8495 170.8336 208.3336Q173.3495 205.9585 173.25 202.5L173.25 82.5Q173.25 63.7727 166.5811 47.6725Q159.9122 31.5724 146.67 18.33Q133.4277 5.0878 117.3275 -1.5811Q101.2273 -8.25 82.5 -8.25Q63.7727 -8.25 47.6725 -1.5811Q31.5723 5.0878 18.33 18.33Q5.0878 31.5723 -1.5811 47.6725Q-8.25 63.7727 -8.25 82.5Z' fill-rule='evenodd'/%3E%3Cdefs%3E%3ClinearGradient id='fav-g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0%25' stop-color='%23FFAF21'/%3E%3Cstop offset='50%25' stop-color='%23F97A19'/%3E%3Cstop offset='100%25' stop-color='%23DD4926'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23fav-g)' transform='matrix(1.2 0 0 1.2 157 125)' d='M75 0L0 90L67.5 90L60 150L135 60L67.5 60L75 0Z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <div class="logo">
+          <svg class="logo-icon" width="22" height="22" viewBox="0 0 512 512">
+            <rect x="32" y="32" width="448" height="448" rx="112" fill="#17181C"/>
+            <path fill="#FFFFFF" transform="matrix(1.2 0 0 1.2 148 116)" d="M-8.25 82.5L-8.25 202.5Q-8.3495 205.9585 -5.8336 208.3336Q-3.4585 210.8495 0 210.75Q3.4585 210.8495 5.8336 208.3336Q8.3495 205.9585 8.25 202.5L8.25 82.5Q8.25 67.0547 13.6629 53.9867Q19.0758 40.9188 29.9973 29.9973Q40.9188 19.0759 53.9868 13.6629Q67.0547 8.25 82.5 8.25Q97.9453 8.25 111.0133 13.6629Q124.0812 19.0758 135.0027 29.9973Q145.9241 40.9188 151.3371 53.9868Q156.75 67.0547 156.75 82.5L156.75 202.5Q156.6505 205.9585 159.1664 208.3336Q161.5415 210.8495 165 210.75Q168.4585 210.8495 170.8336 208.3336Q173.3495 205.9585 173.25 202.5L173.25 82.5Q173.25 63.7727 166.5811 47.6725Q159.9122 31.5724 146.67 18.33Q133.4277 5.0878 117.3275 -1.5811Q101.2273 -8.25 82.5 -8.25Q63.7727 -8.25 47.6725 -1.5811Q31.5723 5.0878 18.33 18.33Q5.0878 31.5723 -1.5811 47.6725Q-8.25 63.7727 -8.25 82.5Z" fill-rule="evenodd"/>
+            <defs>
+              <linearGradient id="logo-g" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#FFAF21"/>
+                <stop offset="50%" stop-color="#F97A19"/>
+                <stop offset="100%" stop-color="#DD4926"/>
+              </linearGradient>
+            </defs>
+            <path fill="url(#logo-g)" transform="matrix(1.2 0 0 1.2 157 125)" d="M75 0L0 90L67.5 90L60 150L135 60L67.5 60L75 0Z"/>
+          </svg>
+          <span class="logo-text">Anthropic Proxy</span>
+          <span class="logo-ver" id="app-version">v1.2.0</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="status-badge" id="status-badge">
+          <span class="status-dot stopped" id="status-dot"></span>
+          <span id="status-text">未启动</span>
+        </div>
+        <button class="btn btn-small btn-primary" id="btn-toggle-service">启动服务</button>
+        <button class="btn btn-small btn-palette" id="btn-open-palette" title="快捷菜单 (⌘K)">⌘K</button>
+      </div>
+    </header>
+
+    <!-- Tabs -->
+    <nav class="tabs">
+      <button class="tab active" data-tab="overview">运行概览</button>
+      <button class="tab" data-tab="logs">实时日志</button>
+      <button class="tab" data-tab="settings">服务设置</button>
+    </nav>
+
+    <!-- Tab 1: Overview -->
+    <main class="tab-content active" id="tab-overview">
+      <div class="metrics-grid">
+        <div class="metric-card" id="card-status">
+          <div class="metric-label">服务状态</div>
+          <div class="metric-value" id="metric-status">已停止</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">监听端口</div>
+          <div class="metric-value" id="metric-port">3456</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">运行时间</div>
+          <div class="metric-value" id="metric-uptime">0s</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">已配置厂商</div>
+          <div class="metric-value" id="metric-provider">-</div>
+        </div>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">请求总数</div>
+          <div class="metric-value" id="stat-requests">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Token 总量</div>
+          <div class="metric-value" id="stat-tokens-total">0</div>
+        </div>
+        <div class="metric-card clickable" id="stat-card-cache" title="点击查看缓存明细">
+          <div class="metric-label">缓存命中率 <span class="stat-caret">▾</span></div>
+          <div class="metric-value" id="stat-cache-pct">0%</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">失败请求</div>
+          <div class="metric-value" id="stat-requests-failed">0</div>
+        </div>
+      </div>
+
+      <div class="section stat-detail" id="stat-detail" hidden>
+        <dl class="kv">
+          <dt>输入 (未缓存)</dt>
+          <dd><code id="stat-tokens-input">0</code></dd>
+          <dt>缓存读取</dt>
+          <dd><code id="stat-tokens-cache-read">0</code></dd>
+          <dt>缓存写入</dt>
+          <dd><code id="stat-tokens-cache-write">0</code></dd>
+          <dt>输出</dt>
+          <dd><code id="stat-tokens-output">0</code></dd>
+        </dl>
+      </div>
+
+      <div class="section">
+        <div class="section-title">本地调用接口</div>
+        <dl class="kv">
+          <dt>Messages API</dt>
+          <dd><code id="endpoint-messages">http://127.0.0.1:3456/v1/messages</code> <button class="btn-copy" data-copy="endpoint-messages">复制</button></dd>
+          <dt>Responses API</dt>
+          <dd><code id="endpoint-responses">http://127.0.0.1:3456/v1/responses</code> <button class="btn-copy" data-copy="endpoint-responses">复制</button></dd>
+          <dt>Models API</dt>
+          <dd><code id="endpoint-models">http://127.0.0.1:3456/v1/models</code> <button class="btn-copy" data-copy="endpoint-models">复制</button></dd>
+          <dt>当前上游地址</dt>
+          <dd><code id="overview-upstream">-</code></dd>
+          <dt>配置文件</dt>
+          <dd><code id="overview-config-path">~/.proxy-rs/gui-settings.json</code></dd>
+          <dt>日志文件</dt>
+          <dd><code id="overview-log-path">~/.proxy-rs/logs/proxy.log</code> <button class="btn-copy" id="btn-open-log-dir">打开目录</button></dd>
+          <dt>开机自启动</dt>
+          <dd><span id="overview-lal">未启用</span></dd>
+        </dl>
+      </div>
+
+      <div class="section">
+        <div class="section-title">快捷操作</div>
+        <div class="actions-row">
+          <button class="btn" id="btn-test-upstream-quick">⚡️ 测试上游连通性</button>
+          <button class="btn" id="btn-goto-logs">📋 查看运行日志</button>
+          <button class="btn" id="btn-goto-settings">⚙️ 修改代理配置</button>
+        </div>
+        <div class="test-result" id="quick-test-result"></div>
+      </div>
+    </main>
+
+    <!-- Tab 2: Logs -->
+    <main class="tab-content" id="tab-logs">
+      <div class="logs-toolbar">
+        <div class="logs-filter-group">
+          <select id="log-level-filter" class="log-select">
+            <option value="ALL">全部级别</option>
+            <option value="INFO">仅 INFO</option>
+            <option value="WARN">仅 WARN</option>
+            <option value="ERROR">仅 ERROR</option>
+          </select>
+          <input type="text" id="log-search-input" class="log-input" placeholder="搜索日志内容...">
+          <span class="log-count" id="log-count">0 条日志</span>
+        </div>
+        <div class="logs-actions">
+          <label class="auto-scroll-label">
+            <input type="checkbox" id="log-autoscroll" checked> 自动滚动
+          </label>
+          <button class="btn btn-small" id="btn-clear-logs">清空</button>
+          <button class="btn btn-small" id="btn-reveal-logs">打开日志目录</button>
+        </div>
+      </div>
+      <div id="logs" class="logs-container"></div>
+    </main>
+
+    <!-- Tab 3: Settings -->
+    <main class="tab-content" id="tab-settings">
+      <form id="settings-form" class="settings-form" onsubmit="return false;">
+        <fieldset class="form-section">
+          <legend>模型提供商</legend>
+          <div class="form-group">
+            <label for="setting-provider">预设服务商</label>
+            <select id="setting-provider"></select>
+          </div>
+          <div class="form-group">
+            <label for="setting-custom-url">自定义接口地址 (可选)</label>
+            <input type="text" id="setting-custom-url" placeholder="留空使用服务商默认接口地址">
+            <div class="hint">支持完整地址或 Base URL，例如 https://api.openai.com</div>
+          </div>
+          <div class="form-group">
+            <label for="setting-api-key">API Key</label>
+            <div class="input-with-btn">
+              <input type="password" id="setting-api-key" placeholder="输入对应服务商的 API 密钥" autocomplete="off">
+              <button type="button" class="btn btn-small btn-show-hide" id="btn-toggle-key-visibility">显示</button>
+            </div>
+          </div>
+          <div class="actions-row" style="margin-top: 8px;">
+            <button type="button" class="btn btn-small" id="btn-fetch-models">🔍 拉取可用模型</button>
+            <button type="button" class="btn btn-small" id="btn-test-upstream-settings">⚡️ 测试连接</button>
+          </div>
+          <div id="models-container" class="models-container"></div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend>Claude Code 一键写入 (~/.claude/settings.json)</legend>
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="setting-claude-model">默认主模型 (ANTHROPIC_MODEL)</label>
+              <input type="text" id="setting-claude-model" placeholder="例如 deepseek-chat">
+            </div>
+            <div class="form-group half">
+              <label for="setting-claude-sonnet">Sonnet 槽位模型</label>
+              <input type="text" id="setting-claude-sonnet" placeholder="例如 deepseek-chat">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="setting-claude-opus">Opus 槽位模型</label>
+              <input type="text" id="setting-claude-opus" placeholder="例如 deepseek-reasoner">
+            </div>
+            <div class="form-group half">
+              <label for="setting-claude-haiku">Haiku 槽位模型</label>
+              <input type="text" id="setting-claude-haiku" placeholder="例如 deepseek-chat">
+            </div>
+          </div>
+          <div class="actions-row">
+            <button type="button" class="btn btn-small btn-primary" id="btn-apply-claude-config">写入 Claude Code 配置</button>
+            <span class="hint" id="claude-config-status"></span>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend>Codex 模型选择器 (~/.codex/config.toml)</legend>
+          <p class="hint">
+            Codex 不会读取自定义 provider 的 <code>/v1/models</code>，因此选择器只显示内置模型。
+            此操作会把本 provider 的真实模型写入 <code>model_catalog_json</code> 目录文件。
+          </p>
+          <div class="actions-row">
+            <button type="button" class="btn btn-small btn-primary" id="btn-apply-codex-config">写入 Codex 模型目录</button>
+            <span class="hint" id="codex-config-status"></span>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend>网络与自启</legend>
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="setting-port">本地端口</label>
+              <input type="number" id="setting-port" placeholder="3456" min="1024" max="65535">
+            </div>
+            <div class="form-group half">
+              <label for="setting-bind">绑定 IP</label>
+              <input type="text" id="setting-bind" placeholder="127.0.0.1">
+            </div>
+          </div>
+          <div class="setting-item-inline">
+            <div>
+              <div class="setting-label">开机自动启动</div>
+              <div class="setting-desc">登录 macOS 时自动在后台启动代理服务</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="setting-launch-at-login">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend>模型重定向 (高级)</legend>
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="setting-reasoning-model">思考模型重写 (Reasoning Model)</label>
+              <input type="text" id="setting-reasoning-model" placeholder="留空使用默认">
+            </div>
+            <div class="form-group half">
+              <label for="setting-completion-model">普通补全模型重写 (Completion Model)</label>
+              <input type="text" id="setting-completion-model" placeholder="留空使用默认">
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="setting-model-map">映射列表 (源模型:目标模型，逗号隔开)</label>
+            <input type="text" id="setting-model-map" placeholder="claude-3-5-sonnet:deepseek-chat,claude-3-opus:deepseek-reasoner">
+          </div>
+          <div class="form-group">
+            <label for="setting-sanitize-terms">指纹清洗短语 (高级，分号隔开)</label>
+            <input type="text" id="setting-sanitize-terms" placeholder="留空使用内置默认；用于覆盖/追加上游内容过滤敏感的固定模板句">
+          </div>
+        </fieldset>
+
+        <div class="settings-save-bar">
+          <button type="button" class="btn btn-primary" id="btn-save-settings">保存配置</button>
+          <span class="save-status" id="save-status"></span>
+        </div>
+      </form>
+    </main>
+  </div>
+
+  <!-- Command Palette Modal (⌘K) -->
+  <div class="palette-overlay" id="palette-overlay">
+    <div class="palette">
+      <input type="text" class="palette-input" id="palette-input" placeholder="输入指令或搜索 (↑↓ 切换，Enter 执行，Esc 关闭)...">
+      <div class="palette-list" id="palette-list"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

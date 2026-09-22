@@ -22,3 +22,14 @@ target
 
 .env
 .task/*
+
+# GUI runtime settings (contains the upstream API key)
+gui-settings.json
+
+# Node (Tauri CLI)
+node_modules/
+npm-debug.log*
+
+# Unrelated reference project kept locally (has its own repository)
+
+.DS_Store

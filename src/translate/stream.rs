@@ -8,7 +8,6 @@ use crate::translate::core;
 #[derive(Debug)]
 enum BlockState {
     Idle,
-    Thinking { index: usize },
     Text { index: usize },
     ToolUse { index: usize },
 }
@@ -17,9 +16,7 @@ impl BlockState {
     fn current_index(&self) -> Option<usize> {
         match self {
             Self::Idle => None,
-            Self::Thinking { index } | Self::Text { index } | Self::ToolUse { index } => {
-                Some(*index)
-            }
+            Self::Text { index } | Self::ToolUse { index } => Some(*index),
         }
     }
 }
@@ -32,6 +29,23 @@ pub struct StreamState {
     block: BlockState,
     next_index: usize,
     message_started: bool,
+    /// True once a single final `message_delta` has been emitted. Guarantees
+    /// `stop_reason` / usage are sent exactly once, even if the upstream
+    /// sends a `finish_reason` (or an empty one) on every chunk.
+    finalized: bool,
+    /// Latest upstream usage, captured from any `usage`-bearing chunk so the
+    /// final `message_delta` carries real token counts.
+    pending_usage: Option<openai::Usage>,
+}
+
+impl StreamState {
+    /// The model reported on the stream so far, falling back to the one
+    /// supplied by the caller when the upstream hasn't echoed one yet.
+    pub fn model(&self) -> &str {
+        self.model
+            .as_deref()
+            .unwrap_or(self.fallback_model.as_str())
+    }
 }
 
 pub fn initial_state(fallback_model: String) -> StreamState {
@@ -42,6 +56,8 @@ pub fn initial_state(fallback_model: String) -> StreamState {
         block: BlockState::Idle,
         next_index: 0,
         message_started: false,
+        finalized: false,
+        pending_usage: None,
     }
 }
 
@@ -57,6 +73,12 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
         if state.model.is_none() {
             state.model = Some(model.clone());
         }
+    }
+
+    // Capture usage whenever the upstream reports it (OpenAI send it on the
+    // final `usage`-bearing chunk when stream_options.include_usage is set).
+    if chunk.usage.is_some() {
+        state.pending_usage = chunk.usage.clone();
     }
 
     let Some(choice) = chunk.choices.first() else {
@@ -79,38 +101,55 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
                 usage: Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
                 },
             },
         });
         state.message_started = true;
     }
 
-    for reasoning in [&choice.delta.reasoning, &choice.delta.reasoning_content]
-        .into_iter()
-        .flatten()
-    {
-        emit_reasoning(&mut events, state, reasoning);
-    }
+    // Emit content deltas only until the stream has been finalized. Once a
+    // real finish_reason has been seen we stop opening new blocks / emitting
+    // deltas, so we never interleave content with stop events.
+    if !state.finalized {
+        // Upstream reasoning / `reasoning_content` is deliberately NOT surfaced
+        // as Anthropic `thinking` content blocks: the Anthropic extended-thinking
+        // contract requires a `signature`, which the upstream does not provide,
+        // so emitting such blocks is a protocol violation that breaks strict
+        // clients (e.g. Claude Code). The assistant's real answer lives in
+        // `content`, which is forwarded below.
+        if let Some(content) = &choice.delta.content {
+            if !content.is_empty() {
+                emit_text(&mut events, state, content);
+            }
+        }
 
-    if let Some(content) = &choice.delta.content {
-        if !content.is_empty() {
-            emit_text(&mut events, state, content);
+        if let Some(tool_calls) = &choice.delta.tool_calls {
+            emit_tool_calls(&mut events, state, tool_calls);
         }
     }
 
-    if let Some(tool_calls) = &choice.delta.tool_calls {
-        emit_tool_calls(&mut events, state, tool_calls);
-    }
-
+    // Only finalize on a *meaningful* finish reason. Some upstreams emit an
+    // empty-string `finish_reason` on every chunk; treat that as "not done".
     if let Some(finish_reason) = &choice.finish_reason {
-        emit_finish(&mut events, state, finish_reason, chunk.usage.as_ref());
+        if !finish_reason.is_empty() {
+            emit_finish(&mut events, state, finish_reason);
+        }
     }
 
     events
 }
 
-pub fn translate_done(_state: &mut StreamState) -> Vec<StreamEvent> {
-    vec![StreamEvent::MessageStop]
+pub fn translate_done(state: &mut StreamState) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    // If the upstream never sent a real finish_reason (e.g. stream closed on
+    // [DONE]), finalize once here with a default stop reason.
+    if !state.finalized {
+        emit_finish(&mut events, state, "stop");
+    }
+    events.push(StreamEvent::MessageStop);
+    events
 }
 
 pub fn translate_error(message: String) -> Vec<StreamEvent> {
@@ -126,29 +165,6 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
     if let Some(index) = state.block.current_index() {
         events.push(StreamEvent::ContentBlockStop { index });
         state.next_index = index + 1;
-    }
-}
-
-fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reasoning: &str) {
-    if !matches!(state.block, BlockState::Thinking { .. }) {
-        close_current_block(events, state);
-        let index = state.next_index;
-        events.push(StreamEvent::ContentBlockStart {
-            index,
-            content_block: ContentBlockStart::Thinking {
-                thinking: String::new(),
-            },
-        });
-        state.block = BlockState::Thinking { index };
-    }
-
-    if let BlockState::Thinking { index } = state.block {
-        events.push(StreamEvent::ContentBlockDelta {
-            index,
-            delta: Delta::ThinkingDelta {
-                thinking: reasoning.to_string(),
-            },
-        });
     }
 }
 
@@ -214,15 +230,34 @@ fn emit_tool_calls(
     }
 }
 
-fn emit_finish(
-    events: &mut Vec<StreamEvent>,
-    state: &mut StreamState,
-    finish_reason: &str,
-    usage: Option<&openai::Usage>,
-) {
+fn emit_finish(events: &mut Vec<StreamEvent>, state: &mut StreamState, finish_reason: &str) {
+    // Close any open content block exactly once, before the final delta.
     close_current_block(events, state);
 
     let stop_reason = core::map_stop_reason(Some(finish_reason));
+
+    // Prefer usage observed on the stream; fall back to the finish chunk's own.
+    let usage = state.pending_usage.as_ref();
+    let (input_tokens, output_tokens, cache_creation, cache_read) = match usage {
+        Some(u) => {
+            // OpenAI-compatible providers expose cached tokens via
+            // prompt_tokens_details.cached_tokens (== cache read). A few also
+            // send explicit cache_creation_input_tokens / cache_read_input_tokens.
+            let cached = u
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .or(u.cache_read_input_tokens)
+                .unwrap_or(0);
+            (
+                Some(u.prompt_tokens),
+                u.completion_tokens,
+                u.cache_creation_input_tokens.unwrap_or(0),
+                cached,
+            )
+        }
+        None => (None, 0, 0, 0),
+    };
 
     events.push(StreamEvent::MessageDelta {
         delta: MessageDeltaData {
@@ -230,10 +265,14 @@ fn emit_finish(
             stop_sequence: None,
         },
         usage: DeltaUsage {
-            input_tokens: usage.map(|u| u.prompt_tokens),
-            output_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
         },
     });
+
+    state.finalized = true;
 }
 
 #[cfg(test)]
@@ -343,51 +382,35 @@ mod tests {
     }
 
     #[test]
-    fn thinking_then_text_produces_two_blocks() {
+    fn thinking_then_text_produces_text_block_only() {
         let mut state = initial_state("fallback".into());
 
+        // Upstream reasoning is suppressed (no valid Anthropic `thinking`
+        // signature is available), so a lone reasoning chunk emits nothing
+        // beyond the opening message_start.
         let e1 = translate_chunk(&mut state, &reasoning_chunk("1", "gpt-4o", "Let me think"));
-        assert_eq!(
-            event_types(&e1),
-            [
-                "message_start",
-                "content_block_start",
-                "content_block_delta"
-            ]
-        );
+        assert_eq!(event_types(&e1), ["message_start"]);
 
         let e2 = translate_chunk(&mut state, &text_chunk("1", "gpt-4o", "Answer: 42"));
         assert_eq!(
             event_types(&e2),
-            [
-                "content_block_stop",
-                "content_block_start",
-                "content_block_delta"
-            ]
+            ["content_block_start", "content_block_delta"]
         );
-
-        if let StreamEvent::ContentBlockStart { index, .. } = &e2[1] {
-            assert_eq!(*index, 1);
+        if let StreamEvent::ContentBlockStart { index, .. } = &e2[0] {
+            assert_eq!(*index, 0);
         }
     }
 
     #[test]
-    fn reasoning_content_produces_thinking_block() {
+    fn reasoning_content_is_suppressed() {
         let mut state = initial_state("fallback".into());
 
         let events = translate_chunk(&mut state, &reasoning_content_chunk("1", "gpt-4o", "Think"));
 
-        assert_eq!(
-            event_types(&events),
-            [
-                "message_start",
-                "content_block_start",
-                "content_block_delta"
-            ]
-        );
-        if let StreamEvent::ContentBlockDelta { delta, .. } = &events[2] {
-            assert!(matches!(delta, Delta::ThinkingDelta { thinking } if thinking == "Think"));
-        }
+        assert_eq!(event_types(&events), ["message_start"]);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
     }
 
     #[test]

@@ -155,6 +155,13 @@ pub enum ResponseContent {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens written to the prompt cache this request (cache breakpoints /
+    /// TTL refresh). Emitted explicitly as 0 when there was no cache write.
+    pub cache_creation_input_tokens: u32,
+    /// Tokens served from the prompt cache this request. Emitted explicitly
+    /// as 0 when the cache was not hit. Clients key off this field to detect
+    /// a cache hit, so it must always be present (never omitted).
+    pub cache_read_input_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,8 +226,6 @@ pub enum ContentBlockStart {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,8 +236,6 @@ pub enum Delta {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
-    #[serde(rename = "thinking_delta")]
-    ThinkingDelta { thinking: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +249,12 @@ pub struct DeltaUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
     pub output_tokens: u32,
+    /// Tokens written to the prompt cache this request. Always emitted (0 when
+    /// none) so clients can detect cache activity from the final delta.
+    pub cache_creation_input_tokens: u32,
+    /// Tokens served from the prompt cache this request. Always emitted (0 when
+    /// none) — this is the field clients use to detect a cache hit.
+    pub cache_read_input_tokens: u32,
 }
 
 impl StreamEvent {
