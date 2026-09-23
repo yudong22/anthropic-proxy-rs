@@ -919,6 +919,15 @@ fn main() {
             test_upstream,
             open_logs_dir
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // On macOS, clicking the Dock icon after the window has been hidden
+            // (closed into the tray) fires `Reopen`. Tauri does not auto-show the
+            // window, so without this the only way back is the tray menu. Restore
+            // it here so the Dock is a first-class way to reopen the console.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                focus_main_window(app);
+            }
+        });
 }

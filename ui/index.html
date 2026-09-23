@@ -28,7 +28,7 @@
             <path fill="url(#logo-g)" transform="matrix(1.2 0 0 1.2 157 125)" d="M75 0L0 90L67.5 90L60 150L135 60L67.5 60L75 0Z"/>
           </svg>
           <span class="logo-text">Anthropic Proxy</span>
-          <span class="logo-ver" id="app-version">v1.5.1</span>
+          <span class="logo-ver" id="app-version">v1.5.2</span>
         </div>
       </div>
       <div class="header-right">
@@ -171,14 +171,14 @@
         <div class="table-responsive">
           <table class="data-table" id="request-logs-table">
             <thead>
-              <!-- Widths are percentages so the columns scale with the window;
-                   模型 ID / 路径 has no width and absorbs the remainder. Every
-                   cell clips its content, so nothing spills into a neighbour. -->
+              <!-- Column widths live in CSS (see the .col-* rules in style.css),
+                   not inline here. Every cell clips its content, so nothing
+                   spills into a neighbour. -->
               <tr>
                 <th style="width: 10%;">时间</th>
-                <th style="width: 17%;">会话</th>
-                <th>模型 ID / 路径</th>
-                <th style="width: 9%; text-align: right;">Input</th>
+                <th class="col-session">会话</th>
+                <th class="col-model">模型 ID / 路径</th>
+                <th class="col-input">Input</th>
                 <th style="width: 9%; text-align: right;">Output</th>
                 <th style="width: 8%; text-align: right;">Duration</th>
                 <th style="width: 10%; text-align: center;">Streamed</th>
