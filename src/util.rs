@@ -26,12 +26,64 @@ pub fn truncate(text: &str, max: usize) -> String {
 }
 
 /// Render a header map as a single `k: v | k: v` log line.
+///
+/// Credential-bearing headers are redacted first. These lines are written to
+/// `~/.proxy-rs/logs/proxy.log`, which is long-lived and routinely copied into
+/// bug reports, so an upstream API key must never land there in the clear. The
+/// leading characters are kept so a key can still be told apart from another
+/// while debugging.
 pub fn format_headers(headers: &HeaderMap) -> String {
     headers
         .iter()
-        .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<non-utf8>")))
+        .map(|(k, v)| {
+            let value = v.to_str().unwrap_or("<non-utf8>");
+            format!("{}: {}", k, redact_header_value(k.as_str(), value))
+        })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+/// Header names whose value is a credential and must not be logged verbatim.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-auth-token",
+    "cookie",
+];
+
+/// Mask a credential, keeping a short prefix for identification.
+///
+/// `Bearer ck_abc…` keeps its scheme so the line still reads naturally; a bare
+/// token keeps its first few characters. Anything short enough that a prefix
+/// would give the value away is masked entirely.
+fn redact_header_value(name: &str, value: &str) -> String {
+    if !SENSITIVE_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        return value.to_string();
+    }
+
+    let (scheme, secret) = match value.split_once(' ') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => {
+            (Some(scheme), rest.trim())
+        }
+        _ => (None, value.trim()),
+    };
+
+    // Below this length a visible prefix would be a meaningful fraction of the
+    // secret, so show nothing at all.
+    const KEEP: usize = 8;
+    let masked = if secret.chars().count() > KEEP + 4 {
+        let prefix: String = secret.chars().take(KEEP).collect();
+        format!("{prefix}…")
+    } else {
+        "…".to_string()
+    };
+
+    match scheme {
+        Some(scheme) => format!("{scheme} {masked}"),
+        None => masked,
+    }
 }
 
 /// Parse a JSON body from the exact bytes the client sent.
@@ -203,6 +255,53 @@ mod tests {
         let out = truncate(text, 4);
         assert!(out.ends_with('…'));
         assert!(out.starts_with('中'));
+    }
+
+    #[test]
+    fn format_headers_redacts_credentials() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "Bearer ck_fm3j4t8apekg.AtU_2TMOY8pdXrOmXHTJPkm-hSbuLhroRjABd8flTgQ",
+            ),
+        );
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_static("sk-ant-secret-value-here"),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let line = format_headers(&headers);
+
+        assert!(
+            !line.contains("AtU_2TMOY8pdXrOmXHTJPkm"),
+            "key leaked: {line}"
+        );
+        assert!(!line.contains("secret-value-here"), "key leaked: {line}");
+        assert!(
+            line.contains("Bearer ck_fm3j4…"),
+            "scheme+prefix kept: {line}"
+        );
+        assert!(
+            line.contains("content-type: application/json"),
+            "others intact"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_nothing_when_the_value_is_too_short() {
+        // A short secret would be given away by any visible prefix.
+        assert_eq!(redact_header_value("authorization", "abc"), "…");
+    }
+
+    #[test]
+    fn redaction_leaves_non_credential_headers_alone() {
+        assert_eq!(
+            redact_header_value("user-agent", "deepseek-harness/0.1.6-alpha.2"),
+            "deepseek-harness/0.1.6-alpha.2"
+        );
     }
 
     #[test]
