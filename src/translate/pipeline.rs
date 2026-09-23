@@ -84,9 +84,11 @@ pub fn translate_request(
     }
 
     let tools = req.tools.and_then(|tools| {
+        let mut seen = std::collections::HashSet::new();
         let filtered: Vec<_> = tools
             .into_iter()
-            .filter(|t| !core::is_batch_tool(t))
+            .filter(|t| !core::is_unsupported_tool(t))
+            .filter(|t| seen.insert(t.name.clone()))
             .map(core::translate_tool)
             .collect();
 
@@ -766,12 +768,13 @@ mod tests {
             tools: Some(vec![anthropic::Tool {
                 name: "read_file".to_string(),
                 description: Some("Read a file".to_string()),
-                input_schema: json!({
+                input_schema: Some(json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
                     "required": ["path"]
-                }),
+                })),
                 tool_type: None,
+                extra: Default::default(),
             }]),
             metadata: None,
             extra: json!({}),
@@ -803,8 +806,9 @@ mod tests {
             tools: Some(vec![anthropic::Tool {
                 name: "batch_tool".to_string(),
                 description: None,
-                input_schema: json!({}),
+                input_schema: Some(json!({})),
                 tool_type: Some("BatchTool".to_string()),
+                extra: Default::default(),
             }]),
             metadata: None,
             extra: json!({}),

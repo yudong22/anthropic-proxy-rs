@@ -30,6 +30,13 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
+    /// Stable key identifying a reusable prompt prefix.
+    ///
+    /// Codex sends the session/thread id here. Upstreams use it to route
+    /// requests that share a prefix to the same prompt cache, so dropping it
+    /// silently removes cache reuse across turns of one conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

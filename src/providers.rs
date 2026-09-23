@@ -24,6 +24,26 @@ pub struct ProviderPreset {
     /// Extra headers sent to the vendor models config endpoint
     #[serde(default)]
     pub config_headers: BTreeMap<String, String>,
+    /// Whether this provider only serves streaming bodies.
+    ///
+    /// Some gateways reject a plain body outright (`11101 Non-stream chat
+    /// request is currently not supported`). When set, every upstream request
+    /// is sent with `stream:true`; a client that asked for a non-streaming
+    /// reply still gets one plain JSON body, aggregated here.
+    #[serde(default)]
+    pub force_stream: bool,
+}
+
+/// Whether the provider with this id only serves streaming bodies.
+///
+/// Unknown ids default to `false`, so a custom URL keeps plain semantics
+/// unless its preset says otherwise.
+pub fn preset_force_stream(presets: &[ProviderPreset], provider_id: &str) -> bool {
+    presets
+        .iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.force_stream)
+        .unwrap_or(false)
 }
 
 pub fn builtin_presets() -> Vec<ProviderPreset> {
@@ -35,6 +55,7 @@ pub fn builtin_presets() -> Vec<ProviderPreset> {
             models_url: None,
             models_config_url: Some("https://copilot.tencent.com/v3/config".to_string()),
             config_headers: BTreeMap::new(),
+            force_stream: true,
         },
         ProviderPreset {
             id: "openai".to_string(),
@@ -43,6 +64,7 @@ pub fn builtin_presets() -> Vec<ProviderPreset> {
             models_url: Some("https://api.openai.com/v1/models".to_string()),
             models_config_url: None,
             config_headers: BTreeMap::new(),
+            force_stream: false,
         },
         ProviderPreset {
             id: "openrouter".to_string(),
@@ -51,6 +73,7 @@ pub fn builtin_presets() -> Vec<ProviderPreset> {
             models_url: Some("https://openrouter.ai/api/v1/models".to_string()),
             models_config_url: None,
             config_headers: BTreeMap::new(),
+            force_stream: false,
         },
         ProviderPreset {
             id: "ollama".to_string(),
@@ -59,6 +82,7 @@ pub fn builtin_presets() -> Vec<ProviderPreset> {
             models_url: Some("http://localhost:11434/v1/models".to_string()),
             models_config_url: None,
             config_headers: BTreeMap::new(),
+            force_stream: false,
         },
     ]
 }
@@ -278,4 +302,31 @@ async fn fetch_workbuddy_models(
     }
 
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workbuddy_preset_forces_streaming() {
+        let presets = builtin_presets();
+        assert!(preset_force_stream(&presets, "workbuddy-cn"));
+    }
+
+    #[test]
+    fn plain_providers_do_not_force_streaming() {
+        let presets = builtin_presets();
+        for id in ["openai", "openrouter", "ollama"] {
+            assert!(!preset_force_stream(&presets, id), "{id} must stay plain");
+        }
+    }
+
+    #[test]
+    fn unknown_provider_keeps_plain_semantics() {
+        // A custom URL has no preset, so it must not silently become a stream.
+        let presets = builtin_presets();
+        assert!(!preset_force_stream(&presets, "some-custom-gateway"));
+        assert!(!preset_force_stream(&[], "workbuddy-cn"));
+    }
 }

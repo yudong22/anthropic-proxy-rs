@@ -3,6 +3,7 @@
 use anthropic_proxy::{
     claude_config, codex_config, launch_agent, metrics, providers, router, service,
     settings::{self, GuiSettings, LogBuffer, DEFAULT_PORT},
+    stats::RequestLogFilter,
     Config, StatsDb,
 };
 use serde::Deserialize;
@@ -171,6 +172,25 @@ async fn clear_logs(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn get_request_logs(
+    filter: Option<RequestLogFilter>,
+    ctx: State<'_, Arc<AppContext>>,
+) -> Result<Value, String> {
+    let f = filter.unwrap_or_default();
+    let res = ctx
+        .stats
+        .query_request_logs(&f)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(&res).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_request_logs(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    ctx.stats.clear_request_logs().map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
 async fn get_settings(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let mut s = ctx.settings.read().await.clone();
     s.api_key = mask_key(&s.api_key);
@@ -178,6 +198,12 @@ async fn get_settings(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> 
     if let Some(obj) = payload.as_object_mut() {
         let port = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
         obj.insert("actual_port".into(), json!(port));
+        // What the provider itself declares, so the UI can label an unset
+        // switch as "following the preset" rather than "off".
+        obj.insert(
+            "force_stream_preset".into(),
+            json!(s.force_stream(&providers::builtin_presets())),
+        );
     }
     Ok(payload)
 }
@@ -203,6 +229,9 @@ struct SaveSettingsBody {
     launch_at_login: bool,
     #[serde(default)]
     sanitize_terms: String,
+    /// `null` keeps following the provider preset's own setting.
+    #[serde(default)]
+    force_stream: Option<bool>,
 }
 
 #[tauri::command]
@@ -236,6 +265,7 @@ async fn save_settings(
     s.model_map = body.model_map.trim().to_string();
     s.launch_at_login = body.launch_at_login;
     s.sanitize_terms = body.sanitize_terms.trim().to_string();
+    s.force_stream = body.force_stream;
 
     s.save().map_err(|e| format!("保存配置失败: {}", e))?;
 
@@ -786,6 +816,8 @@ fn main() {
             stop_service,
             get_logs,
             clear_logs,
+            get_request_logs,
+            clear_request_logs,
             get_settings,
             save_settings,
             get_providers,

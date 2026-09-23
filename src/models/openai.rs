@@ -156,12 +156,25 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Cached prompt tokens.
+    ///
+    /// Providers fill whichever field their lineage uses and often set the
+    /// others to a literal `0` rather than omitting them — WorkBuddy returns
+    /// `cache_read_input_tokens: 0` beside the real `prompt_cache_hit_tokens`.
+    /// Taking the first `Some` would latch onto that zero and report a 0% cache
+    /// hit rate even on a 91% hit, so zero is treated as absent.
     pub fn cache_read_tokens(&self) -> i64 {
-        self.cache_read_input_tokens
-            .or(self.prompt_cache_hit_tokens)
-            .or(self.cached_tokens)
-            .or_else(|| self.prompt_tokens_details.as_ref().map(|d| d.cached_tokens))
-            .unwrap_or(0) as i64
+        [
+            self.cache_read_input_tokens,
+            self.prompt_cache_hit_tokens,
+            self.cached_tokens,
+            self.prompt_tokens_details.as_ref().map(|d| d.cached_tokens),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|v| *v > 0)
+        .max()
+        .unwrap_or(0) as i64
     }
 
     pub fn cache_write_tokens(&self) -> i64 {

@@ -104,15 +104,26 @@ pub struct ImageSource {
     pub data: String,
 }
 
-/// Tool definition
+/// Tool definition.
+///
+/// Anthropic ships two kinds of tool. Client tools (`Read`, `Bash`, …) carry
+/// `input_schema`. Built-in server tools (`web_search_20250305`,
+/// `computer_20250124`, …) are identified by a versioned `type` and carry
+/// their own parameters instead, so `input_schema` must stay optional or the
+/// whole request fails to deserialize with a 422.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,
+    /// Server-tool parameters (`max_uses`, `display_width_px`, …) are preserved
+    /// verbatim so a server tool can still be forwarded when supported.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Anthropic API response

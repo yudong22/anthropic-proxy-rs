@@ -62,6 +62,7 @@ bytes = "1.9"
 
 # SQLite persistence for daily statistics
 rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2.189"
 
 [profile.release]
 opt-level = "z"        # Optimize for size

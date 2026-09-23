@@ -1,6 +1,6 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, openai};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>> {
     let mut result = Vec::new();
@@ -114,18 +114,45 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
 }
 
 pub fn translate_tool(tool: anthropic::Tool) -> openai::Tool {
+    // Server tools have no `input_schema`; fall back to an open object so the
+    // emitted function tool is still well formed.
+    let schema = tool
+        .input_schema
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+
     openai::Tool {
         tool_type: "function".to_string(),
         function: openai::Function {
             name: tool.name,
             description: tool.description,
-            parameters: normalize_schema(tool.input_schema),
+            parameters: normalize_schema(schema),
         },
     }
 }
 
-pub fn is_batch_tool(tool: &anthropic::Tool) -> bool {
-    tool.tool_type.as_deref() == Some("BatchTool")
+/// Whether a tool cannot be represented upstream and must be dropped.
+///
+/// `BatchTool` is an internal Claude Code artifact. Anthropic's built-in server
+/// tools (`web_search_20250305`, `computer_20250124`, …) execute on Anthropic's
+/// servers and have no Chat Completions equivalent — forwarding them as a
+/// function with no real schema would invite bogus tool calls, so they are
+/// dropped too. Versioned `type` values are matched by prefix.
+pub fn is_unsupported_tool(tool: &anthropic::Tool) -> bool {
+    match tool.tool_type.as_deref() {
+        Some("BatchTool") => true,
+        Some(t) => {
+            const SERVER_TOOL_PREFIXES: [&str; 6] = [
+                "web_search_",
+                "web_fetch_",
+                "computer_",
+                "bash_",
+                "text_editor_",
+                "code_execution_",
+            ];
+            SERVER_TOOL_PREFIXES.iter().any(|p| t.starts_with(p))
+        }
+        None => false,
+    }
 }
 
 pub fn normalize_schema(schema: Value) -> Value {
@@ -417,24 +444,117 @@ mod tests {
     }
 
     #[test]
-    fn batch_tool_detected() {
+    fn batch_tool_is_unsupported() {
         let tool = anthropic::Tool {
             name: "x".into(),
             description: None,
-            input_schema: json!({}),
+            input_schema: Some(json!({})),
             tool_type: Some("BatchTool".into()),
+            extra: Default::default(),
         };
-        assert!(is_batch_tool(&tool));
+        assert!(is_unsupported_tool(&tool));
     }
 
     #[test]
-    fn regular_tool_not_batch() {
+    fn regular_tool_is_supported() {
         let tool = anthropic::Tool {
             name: "x".into(),
             description: None,
-            input_schema: json!({}),
+            input_schema: Some(json!({})),
             tool_type: None,
+            extra: Default::default(),
         };
-        assert!(!is_batch_tool(&tool));
+        assert!(!is_unsupported_tool(&tool));
+    }
+
+    /// Anthropic server tools execute on Anthropic's side and have no Chat
+    /// Completions equivalent, so they must be filtered out.
+    #[test]
+    fn server_tools_are_filtered() {
+        for tool_type in [
+            "web_search_20250305",
+            "web_fetch_20250910",
+            "computer_20250124",
+            "bash_20250124",
+            "text_editor_20250728",
+            "code_execution_20250522",
+        ] {
+            let tool = anthropic::Tool {
+                name: "server_tool".into(),
+                description: None,
+                input_schema: None,
+                tool_type: Some(tool_type.to_string()),
+                extra: Default::default(),
+            };
+            assert!(
+                is_unsupported_tool(&tool),
+                "{} should be filtered",
+                tool_type
+            );
+        }
+    }
+
+    /// A plain custom tool keeps working, including one whose schema is absent.
+    #[test]
+    fn unknown_and_custom_tools_are_kept() {
+        for tool_type in [None, Some("custom".to_string())] {
+            let tool = anthropic::Tool {
+                name: "Read".into(),
+                description: Some("read a file".into()),
+                input_schema: Some(json!({"type": "object", "properties": {}})),
+                tool_type,
+                extra: Default::default(),
+            };
+            assert!(!is_unsupported_tool(&tool));
+        }
+    }
+
+    /// A server tool carries no `input_schema`; deserialization must tolerate it
+    /// instead of rejecting the whole request with a 422.
+    #[test]
+    fn tool_without_input_schema_deserializes() {
+        let tool: anthropic::Tool = serde_json::from_value(json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5
+        }))
+        .expect("server tool should deserialize without input_schema");
+
+        assert_eq!(tool.input_schema, None);
+        assert_eq!(tool.extra.get("max_uses"), Some(&json!(5)));
+    }
+
+    /// A custom tool without a schema still translates to a valid function tool.
+    #[test]
+    fn translate_tool_defaults_missing_schema() {
+        let tool = anthropic::Tool {
+            name: "no_schema".into(),
+            description: None,
+            input_schema: None,
+            tool_type: None,
+            extra: Default::default(),
+        };
+        let out = translate_tool(tool);
+        assert_eq!(out.tool_type, "function");
+        assert_eq!(out.function.name, "no_schema");
+        // `normalize_schema` fills in an empty `required` alongside the object.
+        assert_eq!(
+            out.function.parameters,
+            json!({"type": "object", "properties": {}, "required": []})
+        );
+    }
+
+    /// Server-tool parameters must survive deserialization.
+    #[test]
+    fn server_tool_parameters_are_preserved() {
+        let tool: anthropic::Tool = serde_json::from_value(json!({
+            "type": "computer_20250124",
+            "name": "computer",
+            "display_width_px": 1024,
+            "display_height_px": 768
+        }))
+        .unwrap();
+        assert_eq!(tool.extra.get("display_width_px"), Some(&json!(1024)));
+        assert_eq!(tool.extra.get("display_height_px"), Some(&json!(768)));
     }
 }

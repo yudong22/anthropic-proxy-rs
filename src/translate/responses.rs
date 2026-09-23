@@ -1,5 +1,6 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{openai, responses};
+use crate::translate::core::normalize_schema;
 use crate::translate::pipeline::{sanitize_prompt, strip_model_suffix, TranslationPolicy};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +71,18 @@ pub fn translate_responses_request(
             });
         }
         responses::ResponsesInput::Items(items) => {
+            // Track which call ids this request actually declared, so a result
+            // arriving for an unknown id can be reconciled instead of sent as
+            // an orphan (strict upstreams reject the pairing).
+            let mut known_call_ids: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for item in &items {
+                if let responses::ResponseInputItem::FunctionCall { id, call_id, .. } = item {
+                    if let Some(resolved) = call_id.clone().or_else(|| id.clone()) {
+                        known_call_ids.insert(resolved);
+                    }
+                }
+            }
             for item in items {
                 match item {
                     responses::ResponseInputItem::Message { role, content, .. } => {
@@ -117,15 +130,37 @@ pub fn translate_responses_request(
                         ..
                     } => {
                         let resolved_id = call_id.or(id).unwrap_or_else(|| generate_id("call"));
+                        let call = openai::ToolCall {
+                            id: resolved_id,
+                            call_type: "function".to_string(),
+                            function: openai::FunctionCall {
+                                name: sanitize_tool_name(&name),
+                                arguments,
+                            },
+                        };
+
+                        // Parallel tool calls arrive as consecutive
+                        // `function_call` items, but Chat Completions models one
+                        // assistant turn as a single message carrying every
+                        // call. Emitting one message per call leaves the first
+                        // call unanswered at the point the next assistant
+                        // message starts, and strict upstreams reject the whole
+                        // request (`11148 tool calls and tool results do not
+                        // match`), so append to the open turn instead.
+                        if let Some(last) = messages.last_mut() {
+                            if last.role == "assistant" && last.content.is_none() {
+                                if let Some(calls) = last.tool_calls.as_mut() {
+                                    calls.push(call);
+                                    continue;
+                                }
+                            }
+                        }
+
                         messages.push(openai::Message {
                             role: "assistant".to_string(),
                             content: None,
                             reasoning_content: None,
-                            tool_calls: Some(vec![openai::ToolCall {
-                                id: resolved_id,
-                                call_type: "function".to_string(),
-                                function: openai::FunctionCall { name, arguments },
-                            }]),
+                            tool_calls: Some(vec![call]),
                             tool_call_id: None,
                             name: None,
                         });
@@ -135,8 +170,33 @@ pub fn translate_responses_request(
                     } => {
                         let content_str = match output {
                             Value::String(s) => s,
+                            Value::Null => String::new(),
                             other => other.to_string(),
                         };
+                        // If no `function_call` declared this id, the upstream
+                        // receives a tool result with nothing to answer — one
+                        // of the shapes that yields `11148 tool calls and tool
+                        // results do not match`. Emit a matching call once so
+                        // the pair is well-formed: the synthetic call must carry
+                        // the *same* id the result claims, or the mismatch
+                        // remains.
+                        if !known_call_ids.contains(&call_id) {
+                            messages.push(openai::Message {
+                                role: "assistant".to_string(),
+                                content: None,
+                                reasoning_content: None,
+                                tool_calls: Some(vec![openai::ToolCall {
+                                    id: call_id.clone(),
+                                    call_type: "function".to_string(),
+                                    function: openai::FunctionCall {
+                                        name: "tool_result".to_string(),
+                                        arguments: "{}".to_string(),
+                                    },
+                                }]),
+                                tool_call_id: None,
+                                name: None,
+                            });
+                        }
                         messages.push(openai::Message {
                             role: "tool".to_string(),
                             content: Some(openai::MessageContent::Text(content_str)),
@@ -195,6 +255,19 @@ pub fn translate_responses_request(
         })
     });
 
+    // Chat Completions has no field for these Responses parameters, but carrying
+    // them through is worthwhile where the upstream understands them: Codex
+    // relies on `prompt_cache_key` for cross-turn prompt-cache reuse, and
+    // `parallel_tool_calls` for concurrent tool execution. Both are sent via the
+    // flatten escape hatch so they land on the upstream JSON body untouched.
+    let mut extra = serde_json::Map::new();
+    if let Some(key) = req.prompt_cache_key.filter(|k| !k.is_empty()) {
+        extra.insert("prompt_cache_key".to_string(), Value::String(key));
+    }
+    if let Some(parallel) = req.parallel_tool_calls {
+        extra.insert("parallel_tool_calls".to_string(), Value::Bool(parallel));
+    }
+
     Ok(openai::OpenAIRequest {
         model,
         messages,
@@ -206,8 +279,39 @@ pub fn translate_responses_request(
         stream_options,
         tools,
         tool_choice,
-        extra: serde_json::Map::new(),
+        extra,
     })
+}
+
+/// Sanitize a tool name to satisfy upstream constraints (e.g. Tencent Copilot / OpenAI format).
+/// Allowed: ^[a-zA-Z0-9_]{1,64}$.
+/// Non-alphanumeric characters (like `.`, `-`, `:`, `/`) are replaced with `_`.
+/// If the first character is a digit, prepend `_`.
+/// Truncated to at most 64 characters.
+pub fn sanitize_tool_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut sanitized = String::with_capacity(trimmed.len() + 1);
+    for c in trimmed.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            sanitized.push(c);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        sanitized.insert(0, '_');
+    }
+
+    if sanitized.len() > 64 {
+        sanitized.truncate(64);
+    }
+
+    sanitized
 }
 
 /// Convert Responses API tools into the Chat Completions function shape.
@@ -224,21 +328,37 @@ pub fn translate_responses_request(
 /// * anything else (`web_search`, `local_shell`, …) — dropped: there is no
 ///   upstream equivalent, and forwarding the unknown type makes the gateway
 ///   reject the entire request.
+///
+/// Tool names are sanitized against `^[a-zA-Z0-9_]{1,64}$` and deduplicated so
+/// that duplicate or colliding tool declarations do not trigger upstream 11152 errors.
 fn normalize_response_tools(tools: Vec<responses::ResponseTool>) -> Vec<openai::Tool> {
     let mut out = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    normalize_response_tools_inner(tools, &mut out, &mut seen_names);
+    out
+}
 
+fn normalize_response_tools_inner(
+    tools: Vec<responses::ResponseTool>,
+    out: &mut Vec<openai::Tool>,
+    seen_names: &mut std::collections::HashSet<String>,
+) {
     for tool in tools {
         match tool.tool_type.as_str() {
             // A nested namespace is a container, not a callable tool.
             "namespace" => {
                 if let Some(nested) = tool.tools {
-                    out.extend(normalize_response_tools(nested));
+                    normalize_response_tools_inner(nested, out, seen_names);
                 }
             }
             "custom" => {
-                let Some(name) = tool.name.filter(|n| !n.is_empty()) else {
+                let Some(raw_name) = tool.name.filter(|n| !n.is_empty()) else {
                     continue;
                 };
+                let name = sanitize_tool_name(&raw_name);
+                if name.is_empty() || !seen_names.insert(name.clone()) {
+                    continue;
+                }
                 // `format` carries a grammar/lark definition that Chat Completions
                 // cannot express; expose the freeform payload as one string input.
                 let description = tool.description.map(|d| {
@@ -263,25 +383,36 @@ fn normalize_response_tools(tools: Vec<responses::ResponseTool>) -> Vec<openai::
                 });
             }
             "function" => {
-                if let Some(func) = tool.function {
+                if let Some(mut func) = tool.function {
                     // An empty tool name is rejected upstream; drop rather than fail
                     // the entire turn.
                     if func.name.is_empty() {
                         continue;
                     }
+                    let name = sanitize_tool_name(&func.name);
+                    if name.is_empty() || !seen_names.insert(name.clone()) {
+                        continue;
+                    }
+                    func.name = name;
+                    func.parameters = normalize_schema(func.parameters);
                     out.push(openai::Tool {
                         tool_type: "function".to_string(),
                         function: func,
                     });
-                } else if let Some(name) = tool.name.filter(|n| !n.is_empty()) {
+                } else if let Some(raw_name) = tool.name.filter(|n| !n.is_empty()) {
+                    let name = sanitize_tool_name(&raw_name);
+                    if name.is_empty() || !seen_names.insert(name.clone()) {
+                        continue;
+                    }
+                    let raw_schema = tool
+                        .parameters
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
                     out.push(openai::Tool {
                         tool_type: "function".to_string(),
                         function: openai::Function {
                             name,
                             description: tool.description,
-                            parameters: tool
-                                .parameters
-                                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                            parameters: normalize_schema(raw_schema),
                         },
                     });
                 }
@@ -289,8 +420,6 @@ fn normalize_response_tools(tools: Vec<responses::ResponseTool>) -> Vec<openai::
             _ => {}
         }
     }
-
-    out
 }
 
 /// Translate a Responses `tool_choice` into a Chat Completions value.
@@ -319,8 +448,13 @@ fn normalize_tool_choice(
             });
 
             match (kind, name) {
-                ("function", Some(name)) if tool_exists(tools, name) => {
-                    Some(json!({"type": "function", "function": {"name": name}}))
+                ("function", Some(raw_name)) => {
+                    let sanitized = sanitize_tool_name(raw_name);
+                    if tool_exists(tools, &sanitized) {
+                        Some(json!({"type": "function", "function": {"name": sanitized}}))
+                    } else {
+                        Some(json!("auto"))
+                    }
                 }
                 // A choice naming a dropped tool (e.g. web_search) cannot be honoured.
                 _ => Some(json!("auto")),
@@ -613,9 +747,16 @@ pub fn translate_stream_chunk(
         }
     }
 
-    // 4. Handle finish_reason
-    if choice.finish_reason.is_some() {
-        events.extend(close_stream_items(state));
+    // 4. Handle finish_reason.
+    //
+    // Only finalize on a *meaningful* reason: some upstreams send
+    // `"finish_reason": ""` on every chunk, and treating that as the end
+    // closes (and empties) the response before any text arrives — the client
+    // then renders nothing. Mirrors `stream::translate_chunk`.
+    if let Some(finish_reason) = &choice.finish_reason {
+        if !finish_reason.is_empty() {
+            events.extend(close_stream_items(state));
+        }
     }
 
     events
@@ -803,6 +944,7 @@ mod tests {
             reasoning: None,
             store: None,
             include: None,
+            prompt_cache_key: None,
         };
 
         let policy = test_policy();
@@ -876,6 +1018,7 @@ mod tests {
             reasoning: None,
             store: None,
             include: None,
+            prompt_cache_key: None,
         };
 
         let policy = test_policy();
@@ -896,6 +1039,125 @@ mod tests {
         assert_eq!(tools[0].function.name, "get_weather");
     }
 
+    /// Parallel tool calls must collapse into one assistant turn.
+    ///
+    /// Regression: Codex issues several `function_call` items in a row. Emitting
+    /// one assistant message per call left the first call unanswered when the
+    /// next assistant message began, and strict upstreams rejected the whole
+    /// request (`11148 tool calls and tool results do not match`) on every
+    /// subsequent turn of the conversation.
+    #[test]
+    fn parallel_function_calls_share_one_assistant_message() {
+        let items = vec![
+            responses::ResponseInputItem::FunctionCall {
+                item_type: "function_call".to_string(),
+                id: Some("call_00".to_string()),
+                call_id: Some("call_00".to_string()),
+                name: "exec_command".to_string(),
+                arguments: "{\"cmd\":\"ls\"}".to_string(),
+            },
+            responses::ResponseInputItem::FunctionCall {
+                item_type: "function_call".to_string(),
+                id: Some("call_01".to_string()),
+                call_id: Some("call_01".to_string()),
+                name: "exec_command".to_string(),
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+            },
+            responses::ResponseInputItem::FunctionCallOutput {
+                item_type: "function_call_output".to_string(),
+                call_id: "call_00".to_string(),
+                output: Value::String("files".to_string()),
+            },
+            responses::ResponseInputItem::FunctionCallOutput {
+                item_type: "function_call_output".to_string(),
+                call_id: "call_01".to_string(),
+                output: Value::String("/root".to_string()),
+            },
+        ];
+
+        let req = responses::ResponsesRequest {
+            model: "hy3".to_string(),
+            input: responses::ResponsesInput::Items(items),
+            instructions: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            max_tokens: None,
+            stream: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            store: None,
+            include: None,
+            prompt_cache_key: None,
+        };
+
+        let out = translate_responses_request(req, &test_policy()).unwrap();
+
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["assistant", "tool", "tool"],
+            "both calls must live on a single assistant turn: {roles:?}"
+        );
+
+        let calls = out.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2, "both calls must be preserved: {calls:?}");
+        assert_eq!(calls[0].id, "call_00");
+        assert_eq!(calls[1].id, "call_01");
+
+        assert_eq!(out.messages[1].tool_call_id, Some("call_00".to_string()));
+        assert_eq!(out.messages[2].tool_call_id, Some("call_01".to_string()));
+    }
+
+    /// A tool call following an assistant *text* message starts a new turn, since
+    /// merging into it would attach calls to unrelated prose.
+    #[test]
+    fn function_call_after_assistant_text_starts_new_message() {
+        let items = vec![
+            responses::ResponseInputItem::Message {
+                item_type: Some("message".to_string()),
+                id: None,
+                role: "assistant".to_string(),
+                content: responses::ResponseMessageContent::Text("thinking".to_string()),
+            },
+            responses::ResponseInputItem::FunctionCall {
+                item_type: "function_call".to_string(),
+                id: Some("call_00".to_string()),
+                call_id: Some("call_00".to_string()),
+                name: "exec_command".to_string(),
+                arguments: "{}".to_string(),
+            },
+        ];
+
+        let req = responses::ResponsesRequest {
+            model: "hy3".to_string(),
+            input: responses::ResponsesInput::Items(items),
+            instructions: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            max_tokens: None,
+            stream: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            store: None,
+            include: None,
+            prompt_cache_key: None,
+        };
+
+        let out = translate_responses_request(req, &test_policy()).unwrap();
+        assert_eq!(out.messages.len(), 2);
+        assert!(
+            out.messages[0].tool_calls.is_none(),
+            "text message unchanged"
+        );
+        assert_eq!(out.messages[1].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
     /// Build a minimal request carrying `tools`, for the shape-normalization tests.
     fn req_with_tools(tools: Vec<responses::ResponseTool>) -> responses::ResponsesRequest {
         responses::ResponsesRequest {
@@ -913,6 +1175,7 @@ mod tests {
             reasoning: None,
             store: None,
             include: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -1052,6 +1315,55 @@ mod tests {
         }
     }
 
+    /// Codex sends the session id as `prompt_cache_key`; dropping it removes
+    /// cross-turn prompt-cache reuse, so it must reach the upstream body.
+    #[test]
+    fn prompt_cache_key_is_forwarded() {
+        let mut req = req_with_tools(vec![function_tool("exec_command")]);
+        req.prompt_cache_key = Some("01a0c952-88b9-7390-ab02-df5c7e8a41a6".to_string());
+
+        let out = translate_responses_request(req, &test_policy()).unwrap();
+        assert_eq!(
+            out.extra.get("prompt_cache_key"),
+            Some(&json!("01a0c952-88b9-7390-ab02-df5c7e8a41a6"))
+        );
+    }
+
+    /// An absent or empty key must not add a field to the upstream body.
+    #[test]
+    fn absent_prompt_cache_key_adds_nothing() {
+        for value in [None, Some(String::new())] {
+            let mut req = req_with_tools(vec![function_tool("exec_command")]);
+            req.prompt_cache_key = value;
+            let out = translate_responses_request(req, &test_policy()).unwrap();
+            assert!(!out.extra.contains_key("prompt_cache_key"));
+        }
+    }
+
+    /// `parallel_tool_calls` has no Chat Completions field but upstream honors it.
+    #[test]
+    fn parallel_tool_calls_is_forwarded() {
+        for value in [true, false] {
+            let mut req = req_with_tools(vec![function_tool("exec_command")]);
+            req.parallel_tool_calls = Some(value);
+            let out = translate_responses_request(req, &test_policy()).unwrap();
+            assert_eq!(out.extra.get("parallel_tool_calls"), Some(&json!(value)));
+        }
+    }
+
+    /// Nothing extra should be emitted when the client sent none of these.
+    #[test]
+    fn no_optional_fields_yields_empty_extra() {
+        let out =
+            translate_responses_request(req_with_tools(vec![function_tool("t")]), &test_policy())
+                .unwrap();
+        assert!(
+            out.extra.is_empty(),
+            "unexpected extra fields: {:?}",
+            out.extra
+        );
+    }
+
     /// A `function` entry may arrive with a top-level name instead of `function`.
     #[test]
     fn function_tool_with_top_level_name_keeps_parameters() {
@@ -1085,7 +1397,7 @@ mod tests {
         let tools = out.tools.unwrap();
         assert_eq!(
             tools[0].function.parameters,
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "required": []})
         );
     }
 
@@ -1149,6 +1461,85 @@ mod tests {
 
         assert_eq!(resp.usage.as_ref().unwrap().total_tokens, 18);
         assert!(resp.response.is_some());
+    }
+
+    /// A chunk exactly as WorkBuddy/copilot.tencent.com emits it:
+    /// `"finish_reason": ""` on every intermediate chunk, with the real reason
+    /// only on the last one.
+    fn upstream_chunk(content: &str, finish_reason: Option<&str>) -> openai::StreamChunk {
+        openai::StreamChunk {
+            id: Some("cmb-1".to_string()),
+            object: Some("chat.completion.chunk".to_string()),
+            created: Some(1712345678),
+            model: Some("glm-5.3-flash".to_string()),
+            choices: vec![openai::StreamChoice {
+                index: 0,
+                delta: openai::Delta {
+                    role: Some("assistant".to_string()),
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                },
+                finish_reason: finish_reason.map(|s| s.to_string()),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn empty_finish_reason_does_not_close_the_response() {
+        // Regression: upstreams that send `"finish_reason": ""` on every chunk
+        // used to finalize the response on chunk #1, so `response.completed`
+        // arrived with empty output before any text — and the client rendered
+        // nothing at all.
+        let mut state = initial_stream_state("glm-5.3-flash".to_string());
+
+        let first = translate_stream_chunk(&mut state, &upstream_chunk("OK", Some("")));
+        let types: Vec<&str> = first.iter().map(|e| e.event_type()).collect();
+        assert!(
+            !types.contains(&"response.completed"),
+            "empty finish_reason must not finalize: {types:?}"
+        );
+        assert!(
+            types.contains(&"response.output_text.delta"),
+            "text delta should still be emitted: {types:?}"
+        );
+
+        // A second content chunk must still be accepted into the same item.
+        let second = translate_stream_chunk(&mut state, &upstream_chunk("!", Some("")));
+        let types: Vec<&str> = second.iter().map(|e| e.event_type()).collect();
+        assert_eq!(
+            types,
+            vec!["response.output_text.delta"],
+            "no new item should be started: {types:?}"
+        );
+
+        // Only the real reason closes it, and the text is carried through.
+        let last = translate_stream_chunk(&mut state, &upstream_chunk("", Some("stop")));
+        let types: Vec<&str> = last.iter().map(|e| e.event_type()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "response.output_text.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+
+        match &last[0] {
+            responses::ResponsesStreamEvent::OutputTextDone { text, .. } => {
+                assert_eq!(text, "OK!");
+            }
+            other => panic!("expected OutputTextDone, got {other:?}"),
+        }
+
+        match &last[2] {
+            responses::ResponsesStreamEvent::Completed { response } => {
+                assert_eq!(response.output.len(), 1, "completed must carry the text");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1219,5 +1610,153 @@ mod tests {
 
         let done_events = translate_stream_done(&mut state);
         assert!(done_events.is_empty(), "Already finalized");
+    }
+
+    #[test]
+    fn sanitize_tool_name_formats_validly() {
+        assert_eq!(sanitize_tool_name("read_file"), "read_file");
+        assert_eq!(
+            sanitize_tool_name("workspace.edit_file"),
+            "workspace_edit_file"
+        );
+        assert_eq!(
+            sanitize_tool_name("multi:agent-tool/call"),
+            "multi_agent_tool_call"
+        );
+        assert_eq!(sanitize_tool_name("123action"), "_123action");
+        assert_eq!(sanitize_tool_name(""), "");
+        let long_name = "a".repeat(100);
+        assert_eq!(sanitize_tool_name(&long_name).len(), 64);
+    }
+
+    #[test]
+    fn duplicate_and_colliding_tools_are_deduplicated() {
+        let tools = vec![
+            function_tool("execute_code"),
+            function_tool("execute_code"),
+            function_tool("execute.code"),
+            responses::ResponseTool {
+                tool_type: "custom".to_string(),
+                name: Some("execute_code".to_string()),
+                description: None,
+                parameters: None,
+                function: None,
+                tools: None,
+            },
+            responses::ResponseTool {
+                tool_type: "namespace".to_string(),
+                name: Some("ns".to_string()),
+                description: None,
+                parameters: None,
+                function: None,
+                tools: Some(vec![
+                    function_tool("execute_code"),
+                    function_tool("other_tool"),
+                ]),
+            },
+        ];
+
+        let out = translate_responses_request(req_with_tools(tools), &test_policy()).unwrap();
+        let tools = out.tools.expect("tools should survive");
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["execute_code", "other_tool"]
+        );
+    }
+
+    #[test]
+    fn tool_parameters_are_normalized() {
+        let mut tool = function_tool("test_schema");
+        tool.parameters = Some(json!({
+            "type": "object",
+            "properties": {
+                "foo": { "type": "string" }
+            }
+        }));
+
+        let out = translate_responses_request(req_with_tools(vec![tool]), &test_policy()).unwrap();
+        let tools = out.tools.unwrap();
+        // Object schema must have "required" array added by normalize_schema
+        assert_eq!(tools[0].function.parameters["required"], json!([]));
+    }
+
+    fn parse_items(json: &str) -> Vec<openai::Message> {
+        let req: responses::ResponsesRequest = serde_json::from_str(json).unwrap();
+        translate_responses_request(req, &test_policy())
+            .unwrap()
+            .messages
+    }
+
+    #[test]
+    fn parallel_tool_calls_share_one_assistant_message() {
+        // Responses sends parallel calls as consecutive items; Chat Completions
+        // needs them on one assistant message, otherwise the upstream sees an
+        // assistant turn whose calls are never answered before the next turn.
+        let msgs = parse_items(
+            r#"{"model":"m","input":[
+                {"type":"function_call","call_id":"c1","name":"f1","arguments":"{}"},
+                {"type":"function_call","call_id":"c2","name":"f2","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"r1"},
+                {"type":"function_call_output","call_id":"c2","output":"r2"}
+            ]}"#,
+        );
+
+        let assistants: Vec<_> = msgs.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(
+            assistants.len(),
+            1,
+            "both calls must share one assistant message: {msgs:#?}"
+        );
+        let calls = assistants[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[1].id, "c2");
+        assert_eq!(msgs.iter().filter(|m| m.role == "tool").count(), 2);
+    }
+
+    #[test]
+    fn orphan_tool_result_gets_a_matching_call() {
+        // A result for a call the request never declared would reach the
+        // upstream unpaired, which it rejects with `11148 tool calls and tool
+        // results do not match`.
+        let msgs = parse_items(
+            r#"{"model":"m","input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"function_call_output","call_id":"ghost","output":"r"}
+            ]}"#,
+        );
+
+        let tool = msgs.iter().find(|m| m.role == "tool").expect("tool result");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("ghost"));
+        let paired = msgs.iter().any(|m| {
+            m.role == "assistant"
+                && m.tool_calls
+                    .as_ref()
+                    .is_some_and(|v| v.iter().any(|t| t.id == "ghost"))
+        });
+        assert!(
+            paired,
+            "orphan result must be paired with a call: {msgs:#?}"
+        );
+    }
+
+    #[test]
+    fn sequential_tool_turns_stay_separate() {
+        // Two turns (call, result, call, result) must NOT be merged — only
+        // consecutive calls within one turn merge.
+        let msgs = parse_items(
+            r#"{"model":"m","input":[
+                {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"r1"},
+                {"type":"function_call","call_id":"c2","name":"f","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c2","output":"r2"}
+            ]}"#,
+        );
+        let assistants = msgs.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(assistants, 2, "separate turns stay separate: {msgs:#?}");
     }
 }

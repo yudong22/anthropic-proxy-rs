@@ -134,24 +134,88 @@
     <main class="tab-content" id="tab-logs">
       <div class="logs-toolbar">
         <div class="logs-filter-group">
+          <select id="table-model-filter" class="log-select" title="按模型筛选">
+            <option value="all">全部模型</option>
+          </select>
+          <select id="table-status-filter" class="log-select" title="按状态筛选">
+            <option value="all">全部状态</option>
+            <option value="2xx">2xx 成功</option>
+            <option value="4xx">4xx 客户端错误</option>
+            <option value="5xx">5xx 服务端错误</option>
+            <option value="error">仅异常 / 错误</option>
+          </select>
+          <select id="table-streamed-filter" class="log-select" title="按流式模式筛选">
+            <option value="all">全部流式</option>
+            <option value="stream">仅流式 (Stream)</option>
+            <option value="sync">仅非流式</option>
+          </select>
+          <input type="text" id="table-search-input" class="log-input" placeholder="搜索模型/路由/错误...">
+          <span class="log-count" id="table-log-count">0 条记录</span>
+        </div>
+        <div class="logs-actions">
+          <div class="view-mode-group">
+            <button type="button" class="btn-toggle active" id="view-mode-table" title="表格视图">表格</button>
+            <button type="button" class="btn-toggle" id="view-mode-console" title="原始控制台日志">控制台</button>
+          </div>
+          <label class="auto-scroll-label" id="table-autorefresh-label">
+            <input type="checkbox" id="table-autorefresh" checked> 实时刷新
+          </label>
+          <button class="btn btn-small" id="btn-refresh-table" title="刷新表格">🔄 刷新</button>
+          <button class="btn btn-small btn-danger" id="btn-clear-db-logs" title="清空数据库记录">清空记录</button>
+          <button class="btn btn-small" id="btn-reveal-logs" title="在访达中显示日志文件">日志目录</button>
+        </div>
+      </div>
+
+      <!-- Table View (Default) -->
+      <div id="table-view" class="logs-table-view">
+        <div class="table-responsive">
+          <table class="data-table" id="request-logs-table">
+            <thead>
+              <tr>
+                <th style="width: 150px;">时间</th>
+                <th>模型 ID</th>
+                <th style="width: 90px; text-align: right;">Input</th>
+                <th style="width: 90px; text-align: right;">Output</th>
+                <th style="width: 95px; text-align: right;">Duration</th>
+                <th style="width: 85px; text-align: center;">Streamed</th>
+                <th style="width: 95px; text-align: center;">Status</th>
+                <th style="width: 70px; text-align: center;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="request-logs-tbody">
+              <tr>
+                <td colspan="8" class="table-empty">暂无请求记录</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-pagination" id="table-pagination">
+          <div class="pagination-info" id="pagination-info">第 1 页 · 共 0 条</div>
+          <div class="pagination-buttons">
+            <button class="btn btn-small" id="btn-prev-page" disabled>上一页</button>
+            <button class="btn btn-small" id="btn-next-page" disabled>下一页</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Console View (Secondary) -->
+      <div id="console-view" class="logs-console-view" style="display: none;">
+        <div class="console-subbar">
           <select id="log-level-filter" class="log-select">
             <option value="ALL">全部级别</option>
             <option value="INFO">仅 INFO</option>
             <option value="WARN">仅 WARN</option>
             <option value="ERROR">仅 ERROR</option>
           </select>
-          <input type="text" id="log-search-input" class="log-input" placeholder="搜索日志内容...">
+          <input type="text" id="log-search-input" class="log-input" placeholder="搜索控制台内容...">
           <span class="log-count" id="log-count">0 条日志</span>
-        </div>
-        <div class="logs-actions">
-          <label class="auto-scroll-label">
+          <label class="auto-scroll-label" style="margin-left: auto;">
             <input type="checkbox" id="log-autoscroll" checked> 自动滚动
           </label>
-          <button class="btn btn-small" id="btn-clear-logs">清空</button>
-          <button class="btn btn-small" id="btn-reveal-logs">打开日志目录</button>
+          <button class="btn btn-small" id="btn-clear-logs">清空控制台</button>
         </div>
+        <div id="logs" class="logs-container"></div>
       </div>
-      <div id="logs" class="logs-container"></div>
     </main>
 
     <!-- Tab 3: Settings -->
@@ -266,6 +330,17 @@
             <label for="setting-sanitize-terms">指纹清洗短语 (高级，分号隔开)</label>
             <input type="text" id="setting-sanitize-terms" placeholder="留空使用内置默认；用于覆盖/追加上游内容过滤敏感的固定模板句">
           </div>
+          <div class="setting-item-inline">
+            <div>
+              <div class="setting-label">强制流式请求上游</div>
+              <div class="setting-desc">该服务商不支持非流式时开启：所有请求都以流式发送，非流式客户端仍收到一次完整响应</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="setting-force-stream">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="hint" id="force-stream-hint"></div>
         </fieldset>
 
         <div class="settings-save-bar">
@@ -274,6 +349,22 @@
         </div>
       </form>
     </main>
+  </div>
+
+  <!-- Request Detail Modal -->
+  <div class="modal-overlay" id="request-modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modal-req-title">请求详情</h3>
+        <button type="button" class="btn-close" id="btn-close-modal" aria-label="关闭">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-req-body">
+        <!-- Injected via JavaScript -->
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-small btn-primary" id="btn-dismiss-modal">关闭</button>
+      </div>
+    </div>
   </div>
 
   <!-- Command Palette Modal (⌘K) -->

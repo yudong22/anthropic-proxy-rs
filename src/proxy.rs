@@ -3,7 +3,7 @@ use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai, responses};
 use crate::service;
-use crate::stats::{StatsDb, TokenRecord};
+use crate::stats::{RequestOutcome, StatsDb, TokenRecord};
 use crate::translate::{pipeline, responses as responses_pipeline, stream};
 use crate::util::{format_headers, truncate};
 use axum::{
@@ -15,6 +15,7 @@ use axum::{
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use reqwest::Client;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,6 +131,8 @@ pub async fn proxy_handler(
         stats.clone(),
         ApiFlavor::Anthropic,
         is_streaming,
+        "/v1/messages",
+        start,
     )
     .await;
 
@@ -217,6 +220,8 @@ pub async fn responses_proxy_handler(
         stats.clone(),
         ApiFlavor::Responses,
         is_streaming,
+        "/v1/responses",
+        start,
     )
     .await;
 
@@ -301,13 +306,9 @@ pub async fn chat_completions_proxy_handler(
         }
     }
 
-    // 3. For streaming requests, ensure include_usage is true so upstream emits
-    //    a usage chunk with cached tokens.
-    if is_streaming {
-        req.stream_options = Some(openai::StreamOptions {
-            include_usage: true,
-        });
-    }
+    // 3. `stream` / `stream_options` are set by `forward_request`, which owns
+    //    the decision (it also upgrades non-streaming requests for providers
+    //    that only accept streams).
 
     gui_logs
         .push(
@@ -329,6 +330,8 @@ pub async fn chat_completions_proxy_handler(
         stats.clone(),
         ApiFlavor::Chat,
         is_streaming,
+        "/v1/chat/completions",
+        start,
     )
     .await;
 
@@ -351,7 +354,13 @@ pub async fn chat_completions_proxy_handler(
 fn outcome_status(result: &ProxyResult<Response>) -> u16 {
     match result {
         Ok(resp) => resp.status().as_u16(),
-        Err(_) => 500,
+        Err(err) => match err {
+            ProxyError::Config(_) => 500,
+            ProxyError::Transform(_) => 400,
+            ProxyError::Upstream(_) => 502,
+            ProxyError::Serialization(_) => 400,
+            ProxyError::Http(_) => 502,
+        },
     }
 }
 
@@ -391,18 +400,23 @@ async fn finalize_request(
                 .await;
         }
         Some(message) => {
-            // Record the failed request in the stats DB (no tokens).
-            let _ = stats.record_request(false, TokenRecord::default());
+            let duration_ms = start.elapsed().as_millis() as i64;
+            // Record the failed request in the stats DB (no tokens) and request_logs.
+            let _ = stats.record_request_log(RequestOutcome {
+                model: client_model,
+                route,
+                tokens: &TokenRecord::default(),
+                duration_ms,
+                streamed: is_streaming,
+                status,
+                error: Some(&message),
+            });
             gui_logs
                 .push(
                     "ERROR",
                     format!(
                         "POST {} failed model={} stream={} {}ms | {}",
-                        route,
-                        client_model,
-                        is_streaming,
-                        start.elapsed().as_millis(),
-                        message
+                        route, client_model, is_streaming, duration_ms, message
                     ),
                 )
                 .await;
@@ -427,9 +441,32 @@ async fn forward_request(
     stats: Arc<StatsDb>,
     flavor: ApiFlavor,
     streaming: bool,
+    route: &'static str,
+    start: Instant,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
+
+    // Some providers (WorkBuddy) only accept streaming bodies and answer a
+    // non-streaming one with `11101 Non-stream chat request is currently not
+    // supported`. For those, request a stream and aggregate it back into the
+    // single response the client asked for, so the caller's `stream` flag is
+    // honoured at the API boundary regardless.
+    //
+    // Providers are not all configured alike, so this is also discovered at
+    // runtime: a non-streaming request that comes back 11101 is retried once
+    // as a stream. That keeps `/v1/messages` without `stream:true` working
+    // against a provider we do not know rejects plain bodies.
+    let upstream_streaming = streaming || config.force_stream_upstream;
+    if upstream_streaming {
+        openai_req.stream = Some(true);
+        openai_req.stream_options = Some(openai::StreamOptions {
+            include_usage: true,
+        });
+    } else {
+        openai_req.stream = Some(false);
+        openai_req.stream_options = None;
+    }
 
     // Neutralize content-filter fingerprints across every message field once,
     // before sending. This is the Rust port of the Go sanitize pass and covers
@@ -456,10 +493,12 @@ async fn forward_request(
             "non-streaming"
         };
 
-        // Up to two attempts against this URL: the original request, then — if the
-        // first hit a content-policy block — a single degraded retry. A connect
-        // error or retriable 5xx moves on to the next URL.
-        for attempt in 0..=1 {
+        // Up to three attempts against this URL: the original request, plus at
+        // most one recovery retry of either kind — a content-policy degraded
+        // retry, or an upgrade to a stream when the provider refuses plain
+        // bodies (`11101`). A connect error or retriable 5xx instead moves on
+        // to the next URL.
+        for attempt in 0..=2 {
             tracing::debug!(
                 "Sending {} {}request to {} (model: {})",
                 mode,
@@ -522,6 +561,23 @@ async fn forward_request(
                 )
                 .await;
 
+                // Shape-dependent rejections (e.g. 11148 "tool calls and tool
+                // results do not match") can only be diagnosed from the message
+                // skeleton, so attach it whenever the upstream complains about
+                // tool-call pairing.
+                if body.contains("11148") || body.contains("11152") {
+                    gui_logs
+                        .push(
+                            "ERROR",
+                            format!(
+                                "REQUEST SHAPE model={} | {}",
+                                openai_req.model,
+                                describe_message_shape(&openai_req.messages)
+                            ),
+                        )
+                        .await;
+                }
+
                 // Content-policy block → at most one degraded retry against the
                 // same URL, then surface a clear content_blocked error instead of
                 // a raw 400/502.
@@ -544,6 +600,42 @@ async fn forward_request(
                     continue; // attempt == 1: retry the SAME URL with the neutral prompt
                 }
 
+                // Safety net: a provider that only serves streaming bodies may
+                // not be known up front (custom URL rather than a known
+                // preset). If it rejects a plain body with `11101`, re-send as
+                // a stream and aggregate it back into the single body the
+                // client asked for; the client's own `stream` flag is
+                // unaffected.
+                if !upstream_streaming && is_non_stream_unsupported(&body) {
+                    tracing::warn!(
+                        "Upstream rejected non-streaming body ({}); retrying as a stream",
+                        status
+                    );
+                    gui_logs
+                        .push(
+                            "WARN",
+                            format!(
+                                "非流式被上游拒绝(11101) → 改用流式请求重试 (model={})",
+                                openai_req.model
+                            ),
+                        )
+                        .await;
+                    return retry_as_stream(
+                        &config,
+                        &client,
+                        &openai_req,
+                        &api_key,
+                        &gui_logs,
+                        &client_model,
+                        &stats,
+                        flavor,
+                        route,
+                        start,
+                        url,
+                    )
+                    .await;
+                }
+
                 let err = ProxyError::Upstream(format!("Upstream returned {}: {}", status, body));
                 if is_retriable_status(status.as_u16()) {
                     last_err = Some(err);
@@ -563,13 +655,31 @@ async fn forward_request(
             }
 
             return if streaming {
-                streaming_response(response, flavor, client_model, gui_logs, stats)
-            } else {
-                non_streaming_response(
+                streaming_response(
                     response,
+                    flavor,
+                    client_model,
+                    route,
+                    start,
+                    gui_logs,
+                    stats,
+                )
+            } else {
+                // The client wants one JSON body. If the request was upgraded
+                // to a stream upstream, aggregate it first; otherwise parse the
+                // response directly.
+                let resp = if upstream_streaming {
+                    collect_stream_into_response(response).await?
+                } else {
+                    response.json::<openai::OpenAIResponse>().await?
+                };
+                non_streaming_response(
+                    resp,
                     flavor,
                     &openai_req.model,
                     client_model,
+                    route,
+                    start,
                     &config,
                     stats,
                 )
@@ -581,18 +691,177 @@ async fn forward_request(
     Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
 }
 
+/// Accumulates one streaming upstream response into a single
+/// `OpenAIResponse`, for clients that asked for a non-streaming reply.
+///
+/// Needed because some providers (WorkBuddy) only accept `stream:true` and
+/// reject a plain body with `11101`. Merging is done on the same chunk shape
+/// `create_flavor_sse_stream` consumes, so both paths agree on how content,
+/// tool calls and usage are read.
+async fn collect_stream_into_response(
+    response: reqwest::Response,
+) -> ProxyResult<openai::OpenAIResponse> {
+    use futures::StreamExt;
+
+    let mut accumulated = Aggregate::default();
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(ProxyError::Http)?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buffer.find("\n\n") {
+            let frame = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+            for line in frame.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if data.trim() == "[DONE]" {
+                    continue;
+                }
+                if let Ok(chunk_obj) = serde_json::from_str::<openai::StreamChunk>(data) {
+                    accumulated.absorb(&chunk_obj);
+                }
+            }
+        }
+    }
+
+    Ok(accumulated.into_response())
+}
+
+/// Running merge of stream chunks into one response.
+#[derive(Default)]
+struct Aggregate {
+    id: Option<String>,
+    model: Option<String>,
+    created: Option<u64>,
+    content: String,
+    reasoning: String,
+    finish_reason: Option<String>,
+    /// Tool calls keyed by their stream index, since arguments arrive in pieces.
+    tool_calls: BTreeMap<usize, openai::ToolCall>,
+    usage: Option<openai::Usage>,
+}
+
+impl Aggregate {
+    fn absorb(&mut self, chunk: &openai::StreamChunk) {
+        if self.id.is_none() {
+            self.id = chunk.id.clone();
+        }
+        if self.model.is_none() {
+            self.model = chunk.model.clone();
+        }
+        if self.created.is_none() {
+            self.created = chunk.created;
+        }
+        if let Some(usage) = &chunk.usage {
+            self.usage = Some(usage.clone());
+        }
+
+        let Some(choice) = chunk.choices.first() else {
+            return;
+        };
+
+        if let Some(content) = &choice.delta.content {
+            self.content.push_str(content);
+        }
+        if let Some(reasoning) = choice
+            .delta
+            .reasoning_content
+            .as_ref()
+            .or(choice.delta.reasoning.as_ref())
+        {
+            self.reasoning.push_str(reasoning);
+        }
+        // An empty-string finish_reason means "not done yet" on some upstreams.
+        if let Some(reason) = &choice.finish_reason {
+            if !reason.is_empty() {
+                self.finish_reason = Some(reason.clone());
+            }
+        }
+
+        for call in choice.delta.tool_calls.iter().flatten() {
+            let entry = self
+                .tool_calls
+                .entry(call.index)
+                .or_insert_with(|| openai::ToolCall {
+                    id: String::new(),
+                    call_type: "function".to_string(),
+                    function: openai::FunctionCall {
+                        name: String::new(),
+                        arguments: String::new(),
+                    },
+                });
+            if let Some(id) = &call.id {
+                if !id.is_empty() {
+                    entry.id = id.clone();
+                }
+            }
+            if let Some(t) = &call.call_type {
+                entry.call_type = t.clone();
+            }
+            if let Some(f) = &call.function {
+                if let Some(name) = &f.name {
+                    entry.function.name.push_str(name);
+                }
+                if let Some(args) = &f.arguments {
+                    entry.function.arguments.push_str(args);
+                }
+            }
+        }
+    }
+
+    fn into_response(self) -> openai::OpenAIResponse {
+        let mut tool_calls: Vec<openai::ToolCall> = self.tool_calls.into_values().collect();
+        // Drop half-open calls: an id is what lets the client answer them.
+        tool_calls.retain(|c| !c.id.is_empty());
+        let tool_calls = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        };
+
+        let content = if self.content.is_empty() {
+            None
+        } else {
+            Some(self.content)
+        };
+
+        openai::OpenAIResponse {
+            id: self.id,
+            object: Some("chat.completion".to_string()),
+            created: self.created,
+            model: self.model,
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    tool_calls,
+                },
+                finish_reason: self.finish_reason.or(Some("stop".to_string())),
+            }],
+            usage: self.usage.unwrap_or_default(),
+            system_fingerprint: None,
+        }
+    }
+}
+
 /// Translate a successful non-streaming upstream response back to the caller's
 /// protocol.
+#[allow(clippy::too_many_arguments)]
 async fn non_streaming_response(
-    response: reqwest::Response,
+    mut openai_resp: openai::OpenAIResponse,
     flavor: ApiFlavor,
     upstream_model: &str,
     client_model: String,
+    route: &'static str,
+    start: Instant,
     config: &Config,
     stats: Arc<StatsDb>,
 ) -> ProxyResult<Response> {
-    let mut openai_resp: openai::OpenAIResponse = response.json().await?;
-
     let metrics_model = match flavor {
         ApiFlavor::Chat => &client_model,
         _ => upstream_model,
@@ -603,8 +872,18 @@ async fn non_streaming_response(
         metrics_model,
     );
 
-    // Record token breakdown in the persistent daily stats DB.
-    let _ = stats.record_request(true, openai_resp.usage.to_token_record());
+    let tokens = openai_resp.usage.to_token_record();
+    let duration_ms = start.elapsed().as_millis() as i64;
+    // Record token breakdown and request log in the persistent stats DB.
+    let _ = stats.record_request_log(RequestOutcome {
+        model: &client_model,
+        route,
+        tokens: &tokens,
+        duration_ms,
+        streamed: false,
+        status: 200,
+        error: None,
+    });
 
     if config.verbose {
         tracing::trace!(
@@ -650,11 +929,21 @@ fn streaming_response(
     response: reqwest::Response,
     flavor: ApiFlavor,
     client_model: String,
+    route: &'static str,
+    start: Instant,
     gui_logs: Arc<crate::settings::LogBuffer>,
     stats: Arc<StatsDb>,
 ) -> ProxyResult<Response> {
     let upstream = response.bytes_stream();
-    let sse_stream = create_flavor_sse_stream(upstream, flavor, client_model, gui_logs, stats);
+    let sse_stream = create_flavor_sse_stream(
+        upstream,
+        flavor,
+        client_model,
+        route,
+        start,
+        gui_logs,
+        stats,
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -767,6 +1056,7 @@ async fn list_models_via_config(
         models_url: None,
         models_config_url: Some(url),
         config_headers: Default::default(),
+        force_stream: false,
     };
 
     let models = crate::providers::fetch_models(client, &preset, &key)
@@ -912,6 +1202,83 @@ fn is_content_blocked(status: u16, body: &str) -> bool {
     body.contains("11128") || body.contains("unapproved channel")
 }
 
+/// Re-send a request as a stream and aggregate it into one non-streaming
+/// response, for upstreams that reject plain bodies (`11101`).
+///
+/// Used as a fallback when the provider was not known to require streaming up
+/// front. The client still receives a single JSON body, since it never asked
+/// for a stream.
+#[allow(clippy::too_many_arguments)]
+async fn retry_as_stream(
+    config: &Config,
+    client: &Client,
+    openai_req: &openai::OpenAIRequest,
+    api_key: &Option<String>,
+    gui_logs: &Arc<crate::settings::LogBuffer>,
+    client_model: &str,
+    stats: &Arc<StatsDb>,
+    flavor: ApiFlavor,
+    route: &'static str,
+    start: Instant,
+    url: &str,
+) -> ProxyResult<Response> {
+    let mut streamed_req = openai_req.clone();
+    streamed_req.stream = Some(true);
+    streamed_req.stream_options = Some(openai::StreamOptions {
+        include_usage: true,
+    });
+
+    let builder = client
+        .post(url)
+        .json(&streamed_req)
+        .timeout(Duration::from_secs(300));
+    let response = apply_upstream_auth(builder, config, api_key)
+        .send()
+        .await
+        .map_err(ProxyError::Http)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(ProxyError::Upstream(format!(
+            "Upstream returned {} (also as a stream): {}",
+            status, body
+        )));
+    }
+
+    let resp = collect_stream_into_response(response).await?;
+    gui_logs
+        .push(
+            "INFO",
+            format!("流式重试成功，已聚合为单次响应 (model={})", client_model),
+        )
+        .await;
+    non_streaming_response(
+        resp,
+        flavor,
+        &streamed_req.model,
+        client_model.to_string(),
+        route,
+        start,
+        config,
+        stats.clone(),
+    )
+    .await
+}
+
+/// Detect "this upstream only serves streaming bodies".
+///
+/// Reported as HTTP 400 with business code `11101` and the message
+/// `Non-stream chat request is currently not supported`. Rather than surfacing
+/// a 502 to the client, the caller re-sends the same request with
+/// `stream:true` and aggregates it back into one body.
+fn is_non_stream_unsupported(body: &str) -> bool {
+    body.contains("11101") && body.contains("Non-stream")
+}
+
 /// Replace the leading `system` message(s) with the neutral degraded prompt.
 /// Other (user/assistant/tool) messages are preserved so the user's actual
 /// request still gets answered — we are only washing out the blocked system
@@ -1013,6 +1380,7 @@ fn upstream_code_hint(body: &str) -> Option<&'static str> {
         11135 => "图片数据无效",
         11148 => "tool_calls 与 tool_result 不匹配",
         11151 => "存在空内容消息",
+        11152 => "工具名称不符合规范或存在重复名称（只允许字母、数字、下划线，最多64字符且不可重名）",
         _ => return None,
     })
 }
@@ -1040,6 +1408,36 @@ async fn log_upstream_failure(
     tracing::warn!("Upstream failure: {}", msg);
 }
 
+/// Compact skeleton of the outbound message list, for diagnosing upstream
+/// rejections that depend on message *shape* rather than content.
+///
+/// A 11148 ("tool calls and tool results do not match") is unreadable without
+/// knowing which calls had results and in what order, so log the roles, the
+/// tool-call ids and the result ids — never the message bodies (too large, and
+/// they may hold user content).
+fn describe_message_shape(messages: &[crate::models::openai::Message]) -> String {
+    let parts: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let calls: Vec<String> = m
+                .tool_calls
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .map(|t| format!("{}:{}", t.id, t.function.name))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match m.role.as_str() {
+                "tool" => format!("tool({})", m.tool_call_id.as_deref().unwrap_or("<no-id>")),
+                "assistant" if !calls.is_empty() => format!("assistant[{}]", calls.join(",")),
+                other => other.to_string(),
+            }
+        })
+        .collect();
+    format!("{} msgs: {}", messages.len(), parts.join(" > "))
+}
+
 /// Serialize one SSE event in the `event:`/`data:` framing both APIs use.
 fn serialize_sse_event<T: serde::Serialize>(event_type: &str, event: &T) -> String {
     format!(
@@ -1060,12 +1458,16 @@ fn create_flavor_sse_stream(
         + 'static,
     flavor: ApiFlavor,
     client_model: String,
+    route: &'static str,
+    start: Instant,
     gui_logs: Arc<crate::settings::LogBuffer>,
     stats: Arc<StatsDb>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
-        let mut stats_written = false;
+        let mut tokens = TokenRecord::default();
+        let mut usage_captured = false;
+        let mut stream_error: Option<String> = None;
 
         // Only the Anthropic and Responses APIs need translation state.
         let mut anthropic_state = match flavor {
@@ -1077,17 +1479,18 @@ fn create_flavor_sse_stream(
             _ => None,
         };
 
-        // Record usage exactly once per stream, falling back to a zero-token
-        // success when the upstream never sends a usage chunk.
+        // Record usage exactly once per stream, when the stream ends. Capturing
+        // a usage chunk only stores the token numbers — the DB row is written
+        // once, after the response has been fully delivered.
         macro_rules! capture_usage {
             ($usage:expr) => {
-                if !stats_written {
+                if !usage_captured {
                     let usage = $usage;
                     if flavor == ApiFlavor::Chat {
                         metrics::tokens(usage.prompt_tokens, usage.completion_tokens, &client_model);
                     }
-                    let _ = stats.record_request(true, usage.to_token_record());
-                    stats_written = true;
+                    tokens = usage.to_token_record();
+                    usage_captured = true;
                 }
             };
         }
@@ -1217,6 +1620,7 @@ fn create_flavor_sse_stream(
                     }
                 }
                 Err(e) => {
+                    stream_error = Some(format!("{}", e));
                     match flavor {
                         ApiFlavor::Anthropic => {
                             tracing::error!("Stream error: {}", e);
@@ -1246,8 +1650,22 @@ fn create_flavor_sse_stream(
             }
         }
 
-        if !stats_written {
-            let _ = stats.record_request(true, TokenRecord::default());
+        // Exactly one DB write per request, now that the stream has finished.
+        // Streaming previously wrote as soon as a usage chunk appeared, which
+        // both hit SQLite per chunk and left a row behind if the stream then
+        // failed.
+        {
+            let duration_ms = start.elapsed().as_millis() as i64;
+            let status = if stream_error.is_some() { 500 } else { 200 };
+            let _ = stats.record_request_log(RequestOutcome {
+                model: &client_model,
+                route,
+                tokens: &tokens,
+                duration_ms,
+                streamed: true,
+                status,
+                error: stream_error.as_deref(),
+            });
         }
 
         // The Responses API stream must always terminate with a completed
@@ -1277,6 +1695,8 @@ fn create_sse_stream(
         upstream,
         ApiFlavor::Anthropic,
         fallback_model,
+        "/v1/messages",
+        Instant::now(),
         gui_logs,
         stats,
     )
@@ -1295,6 +1715,8 @@ fn create_responses_sse_stream(
         upstream,
         ApiFlavor::Responses,
         fallback_model,
+        "/v1/responses",
+        Instant::now(),
         gui_logs,
         stats,
     )
@@ -1303,12 +1725,11 @@ fn create_responses_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::create_sse_stream;
-    use super::{apply_degraded_prompt, is_content_blocked};
+    use super::{apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported};
     use crate::models::{openai, responses};
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
-    use rusqlite;
     use serde_json::{json, Value};
     use std::fmt;
 
@@ -1322,6 +1743,22 @@ mod tests {
         assert!(!is_content_blocked(502, "11128"));
         // 400 without the block signature is a generic upstream failure.
         assert!(!is_content_blocked(400, "{\"error\":\"bad request\"}"));
+    }
+
+    #[test]
+    fn non_stream_unsupported_detects_11101() {
+        assert!(is_non_stream_unsupported(
+            "{\"code\":11101,\"msg\":\"Non-stream chat request is currently not supported\"}"
+        ));
+        // 11101 also covers parameter parse failures, which must NOT be
+        // retried as a stream — only the non-stream refusal carries the
+        // "Non-stream" marker.
+        assert!(!is_non_stream_unsupported(
+            "{\"code\":11101,\"msg\":\"invalid parameter\"}"
+        ));
+        assert!(!is_non_stream_unsupported(
+            "{\"code\":11148,\"msg\":\"tool calls and tool results do not match\"}"
+        ));
     }
 
     #[test]
@@ -1495,21 +1932,9 @@ mod tests {
     }
 
     fn mock_stats() -> std::sync::Arc<crate::stats::StatsDb> {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS daily_stats (
-                date TEXT PRIMARY KEY,
-                requests_total INTEGER NOT NULL DEFAULT 0,
-                requests_success INTEGER NOT NULL DEFAULT 0,
-                requests_failed INTEGER NOT NULL DEFAULT 0,
-                tokens_input INTEGER NOT NULL DEFAULT 0,
-                tokens_cache_read INTEGER NOT NULL DEFAULT 0,
-                tokens_cache_write INTEGER NOT NULL DEFAULT 0,
-                tokens_output INTEGER NOT NULL DEFAULT 0
-            );",
-        )
-        .unwrap();
-        std::sync::Arc::new(crate::stats::StatsDb::from_conn(conn))
+        // Inline mode: writes are synchronous, so tests can assert on them
+        // immediately without waiting on the writer thread.
+        crate::stats::StatsDb::in_memory().unwrap()
     }
 
     async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
@@ -1904,6 +2329,52 @@ mod tests {
         assert!(raw.contains("data: [DONE]"));
     }
 
+    /// Upstreams such as WorkBuddy send `"finish_reason": ""` on every chunk.
+    /// The stream must stay open through those, and only close on the real
+    /// reason — otherwise the client gets an empty completed response.
+    #[tokio::test]
+    async fn responses_stream_with_empty_finish_reason_still_delivers_text() {
+        let chunks = vec![
+            openai_chunk("cmb-1", "glm-5.3-flash", Some("OK"), Some("")),
+            openai_chunk("cmb-1", "glm-5.3-flash", Some("!"), Some("")),
+            openai_chunk("cmb-1", "glm-5.3-flash", None, Some("stop")),
+            openai_done(),
+        ];
+        let s = stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, TestError>(Bytes::from(c))),
+        );
+        let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
+        let sse =
+            super::create_responses_sse_stream(s, "glm-5.3-flash".to_string(), logs, mock_stats());
+        tokio::pin!(sse);
+        let mut raw = String::new();
+        while let Some(item) = sse.next().await {
+            raw.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+
+        // `completed` must come last and carry the accumulated text — not
+        // arrive first with an empty `output` array.
+        let first_done = raw.find("response.output_text.done").unwrap();
+        let completed = raw.find("response.completed").unwrap();
+        assert!(
+            first_done < completed,
+            "text must be closed before the response completes: {raw}"
+        );
+        // The completed event itself must carry the accumulated text, not an
+        // empty `output` array. (`response.created` legitimately has one.)
+        let completed_body = &raw[completed..];
+        assert!(
+            completed_body.contains("OK!"),
+            "completed response must carry the text: {raw}"
+        );
+        assert!(
+            completed_body.contains("\"status\":\"completed\""),
+            "completed event must be the terminal one: {raw}"
+        );
+    }
+
     #[tokio::test]
     async fn responses_handler_end_to_end_non_streaming() {
         use axum::routing::post;
@@ -1970,6 +2441,7 @@ mod tests {
             reasoning: None,
             store: None,
             include: None,
+            prompt_cache_key: None,
         };
 
         let response = super::responses_proxy_handler(
@@ -2047,6 +2519,7 @@ mod tests {
             reasoning: None,
             store: None,
             include: None,
+            prompt_cache_key: None,
         };
 
         let response = super::responses_proxy_handler(
@@ -2128,6 +2601,65 @@ mod tests {
         assert_eq!(rec.input, 30);
         assert_eq!(rec.cache_read, 50);
         assert_eq!(rec.output, 10);
+
+        // 5. WorkBuddy shape: Anthropic-style fields present but zeroed, with
+        //    the real hit count in the DeepSeek field. The zero must not win.
+        let usage_workbuddy = openai::Usage {
+            prompt_tokens: 1337,
+            completion_tokens: 10,
+            total_tokens: 1347,
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            prompt_cache_hit_tokens: Some(1216),
+            prompt_cache_miss_tokens: Some(121),
+            prompt_tokens_details: Some(openai::PromptTokensDetails {
+                cached_tokens: 1216,
+                audio_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        let rec = usage_workbuddy.to_token_record();
+        assert_eq!(
+            rec.cache_read, 1216,
+            "zero-valued fields must not mask a real hit"
+        );
+        assert_eq!(
+            rec.input, 121,
+            "uncached input should be prompt_tokens - hits"
+        );
+        assert_eq!(rec.output, 10);
+    }
+
+    /// A response with no cache information reports zero rather than inventing
+    /// a hit from an unrelated field.
+    #[test]
+    fn test_usage_cache_read_zero_when_absent() {
+        let usage = openai::Usage {
+            prompt_tokens: 500,
+            completion_tokens: 20,
+            total_tokens: 520,
+            cache_read_input_tokens: Some(0),
+            ..Default::default()
+        };
+        let rec = usage.to_token_record();
+        assert_eq!(rec.cache_read, 0);
+        assert_eq!(rec.input, 500);
+    }
+
+    /// Explicit cache fields are still honored when they carry the real value.
+    #[test]
+    fn test_usage_explicit_zero_is_not_overridden_by_details() {
+        // Anthropic-style reads win only when positive; a zero reads as "no
+        // cache" and the remaining sources are consulted instead.
+        let usage = openai::Usage {
+            prompt_tokens: 200,
+            completion_tokens: 5,
+            total_tokens: 205,
+            cache_read_input_tokens: Some(0),
+            cached_tokens: Some(150),
+            ..Default::default()
+        };
+        assert_eq!(usage.cache_read_tokens(), 150);
     }
 
     #[tokio::test]
@@ -2385,5 +2917,369 @@ mod tests {
         assert_eq!(today.tokens_cache_read, 80);
         assert_eq!(today.tokens_output, 20);
         assert_eq!(today.cache_hit_pct(), 80);
+    }
+
+    /// A provider that only serves streaming bodies (`force_stream`): the
+    /// non-streaming client still gets one plain JSON body, and the upstream
+    /// sees exactly one request, with `stream:true` on it.
+    #[tokio::test]
+    async fn force_stream_provider_serves_a_non_streaming_client_one_json_body() {
+        use axum::routing::post;
+        use axum::Json;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+
+        let mock_upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(req): Json<openai::OpenAIRequest>| {
+                let calls = calls_for_handler.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                    // A plain body is refused outright, exactly as WorkBuddy
+                    // does. If the proxy ever stops upgrading, this fires.
+                    if req.stream != Some(true) {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "code": 11101,
+                                "msg": "Non-stream chat request is currently not supported"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    assert!(
+                        req.stream_options.map(|s| s.include_usage).unwrap_or(false),
+                        "an upgraded request must ask for usage"
+                    );
+
+                    let chunk1 = json!({
+                        "id": "cmb-1", "object": "chat.completion.chunk",
+                        "created": 1700000000, "model": "glm",
+                        "choices": [{"index": 0, "delta": {"content": "Hello "}}]
+                    });
+                    let chunk2 = json!({
+                        "id": "cmb-1", "object": "chat.completion.chunk",
+                        "created": 1700000000, "model": "glm",
+                        "choices": [{"index": 0, "delta": {"content": "world"}, "finish_reason": "stop"}]
+                    });
+                    let chunk_usage = json!({
+                        "id": "cmb-1", "object": "chat.completion.chunk",
+                        "created": 1700000000, "model": "glm", "choices": [],
+                        "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+                    });
+
+                    let stream = futures::stream::iter(
+                        [chunk1, chunk2, chunk_usage]
+                            .into_iter()
+                            .map(|c| {
+                                Ok::<_, std::io::Error>(Bytes::from(format!(
+                                    "data: {}\n\n",
+                                    serde_json::to_string(&c).unwrap()
+                                )))
+                            })
+                            .chain(std::iter::once(Ok::<_, std::io::Error>(Bytes::from(
+                                "data: [DONE]\n\n",
+                            )))),
+                    );
+
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        "Content-Type",
+                        axum::http::HeaderValue::from_static("text/event-stream"),
+                    );
+                    (headers, axum::body::Body::from_stream(stream)).into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_upstream).await.unwrap();
+        });
+
+        let config = std::sync::Arc::new(Config {
+            upstream_urls: vec![format!("http://127.0.0.1:{}", port)],
+            force_stream_upstream: true,
+            ..Default::default()
+        });
+        let service = crate::service::ServiceController::new(8080, false);
+        service.mark_running(8080);
+
+        let req = openai::OpenAIRequest {
+            model: "glm".to_string(),
+            messages: vec![openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Text("Hi".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            // The client explicitly asked for a single body, not a stream.
+            stream: Some(false),
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let response = super::chat_completions_proxy_handler(
+            axum::Extension(config),
+            axum::Extension(reqwest::Client::new()),
+            axum::Extension(std::sync::Arc::new(crate::settings::LogBuffer::new(10))),
+            axum::Extension(service),
+            axum::Extension(mock_stats()),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json",
+            "a non-streaming client must not be handed an event stream"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: openai::OpenAIResponse = serde_json::from_slice(&body).unwrap();
+
+        // The two SSE chunks were aggregated back into one assistant message.
+        assert_eq!(parsed.choices.len(), 1);
+        assert_eq!(
+            parsed.choices[0].message.content.as_deref(),
+            Some("Hello world")
+        );
+        assert_eq!(parsed.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(parsed.usage.prompt_tokens, 7);
+        assert_eq!(parsed.usage.completion_tokens, 2);
+
+        // And it took a single upstream call: the upgrade happened up front,
+        // rather than as a retry after the 11101 refusal.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Feeds SSE text through `collect_stream_into_response` by serving it
+    /// from a real HTTP socket, so the bytes arrive as a genuine response body.
+    async fn aggregate(sse: &str) -> openai::OpenAIResponse {
+        let body = sse.to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let payload = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                use tokio::io::AsyncWriteExt;
+                let _ = sock.write_all(payload.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let resp = reqwest::get(format!("http://{}/", addr)).await.unwrap();
+        super::collect_stream_into_response(resp).await.unwrap()
+    }
+
+    fn text_chunk(content: &str, finish: Option<&str>) -> String {
+        let delta = json!({"content": content});
+        let mut choice = json!({"index": 0, "delta": delta});
+        if let Some(f) = finish {
+            choice["finish_reason"] = json!(f);
+        }
+        format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "id": "cmb-1", "model": "glm", "choices": [choice]
+            }))
+            .unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn aggregate_merges_text_chunks() {
+        let sse = format!(
+            "{}{}{}",
+            text_chunk("Hello", Some("")),
+            text_chunk(" world", Some("")),
+            text_chunk("", Some("stop")),
+        );
+        let resp = aggregate(&sse).await;
+        assert_eq!(resp.choices.len(), 1);
+        assert_eq!(
+            resp.choices[0].message.content.as_deref(),
+            Some("Hello world")
+        );
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.choices[0].message.role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn aggregate_merges_split_tool_call_arguments() {
+        // Arguments arrive in fragments across chunks, keyed by index.
+        let mk = |id: Option<&str>, name: Option<&str>, args: Option<&str>| {
+            let mut func = json!({});
+            if let Some(n) = name {
+                func["name"] = json!(n);
+            }
+            if let Some(a) = args {
+                func["arguments"] = json!(a);
+            }
+            let mut tc = json!({"index": 0, "function": func});
+            if let Some(i) = id {
+                tc["id"] = json!(i);
+                tc["type"] = json!("function");
+            }
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string(&json!({
+                    "id": "cmb-1", "model": "glm",
+                    "choices": [{"index": 0, "delta": {"tool_calls": [tc]}}]
+                }))
+                .unwrap()
+            )
+        };
+
+        let sse = format!(
+            "{}{}{}{}",
+            mk(Some("c1"), Some("exec_command"), None),
+            mk(None, None, Some(r#"{\"cmd\""#)),
+            mk(None, None, Some(r#":\"ls\"}"#)),
+            text_chunk("", Some("tool_calls")),
+        );
+        let resp = aggregate(&sse).await;
+        let calls = resp.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].function.name, "exec_command");
+        assert_eq!(calls[0].function.arguments, r#"{\"cmd\":\"ls\"}"#);
+    }
+
+    #[tokio::test]
+    async fn aggregate_captures_usage_and_drops_half_open_calls() {
+        // A tool call that never received an id would be unanswerable, so it
+        // must not reach the client.
+        let usage_chunk = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "id": "cmb-1", "model": "glm",
+                "choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"name": "orphan"}}
+                ]}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+            }))
+            .unwrap()
+        );
+        let sse = format!("{}{}", text_chunk("hi", Some("")), usage_chunk);
+        let resp = aggregate(&sse).await;
+        assert_eq!(resp.usage.prompt_tokens, 10);
+        assert_eq!(resp.usage.completion_tokens, 4);
+        assert!(
+            resp.choices[0].message.tool_calls.is_none(),
+            "half-open tool call must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_request_is_upgraded_when_provider_requires_stream() {
+        // WorkBuddy rejects a plain body (11101), so the outbound request must
+        // ask for a stream even though the client did not.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_for_handler = seen.clone();
+        let mock_upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                |axum::Json(req): axum::Json<openai::OpenAIRequest>| async move {
+                    *seen_for_handler.lock().unwrap() =
+                        Some((req.stream, req.stream_options.is_some()));
+                    axum::Json(openai::OpenAIResponse {
+                        id: Some("cmb-1".into()),
+                        object: Some("chat.completion".into()),
+                        created: Some(1),
+                        model: Some("glm".into()),
+                        choices: vec![openai::Choice {
+                            index: 0,
+                            message: openai::ChoiceMessage {
+                                role: "assistant".into(),
+                                content: Some("direct".into()),
+                                tool_calls: None,
+                            },
+                            finish_reason: Some("stop".into()),
+                        }],
+                        usage: openai::Usage::default(),
+                        system_fingerprint: None,
+                    })
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock_upstream).await.unwrap() });
+
+        let config = std::sync::Arc::new(Config {
+            upstream_urls: vec![format!("http://{}/v1/chat/completions", addr)],
+            force_stream_upstream: true,
+            ..Default::default()
+        });
+        let req = openai::OpenAIRequest {
+            model: "glm".into(),
+            messages: vec![openai::Message {
+                role: "user".into(),
+                content: Some(openai::MessageContent::Text("hi".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: None,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let resp = super::forward_request(
+            config,
+            reqwest::Client::new(),
+            req,
+            None,
+            std::sync::Arc::new(crate::settings::LogBuffer::new(10)),
+            "glm".to_string(),
+            mock_stats(),
+            super::ApiFlavor::Chat,
+            false,
+            "/v1/chat/completions",
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let (stream, has_opts) = seen.lock().unwrap().unwrap();
+        assert_eq!(stream, Some(true), "must upgrade to stream upstream");
+        assert!(has_opts, "must request usage in the stream");
     }
 }

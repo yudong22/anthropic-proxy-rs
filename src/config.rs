@@ -53,6 +53,13 @@ pub struct Config {
     /// When true (WorkBuddy/CodeBuddy flavor), neutralize upstream content-filter
     /// fingerprints across every outbound message field. See pipeline.rs.
     pub sanitize_fingerprints: bool,
+    /// When true, a non-streaming client request is served by requesting a
+    /// stream from the upstream and aggregating it back into one response.
+    ///
+    /// WorkBuddy rejects non-streaming bodies outright (`11101 Non-stream chat
+    /// request is currently not supported`), so a `/v1/messages` call without
+    /// `stream:true` would always 502 without this.
+    pub force_stream_upstream: bool,
     /// Optional gateway wallet-balance endpoint for `GET /v1/credits`.
     /// When unset, the WorkBuddy flavor auto-uses its billing resource endpoint.
     pub credits_endpoint: Option<String>,
@@ -76,6 +83,7 @@ impl Default for Config {
             models_flavor: ModelsFlavor::OpenAI,
             credits_endpoint: None,
             sanitize_fingerprints: false,
+            force_stream_upstream: false,
         }
     }
 }
@@ -101,6 +109,14 @@ impl Config {
             ModelsFlavor::OpenAI
         };
         let sanitize_fingerprints = models_flavor == ModelsFlavor::WorkBuddyConfig;
+        // Providers that only serve streaming bodies declare it in their preset
+        // (`force_stream`), or the user turns it on per-provider in the GUI.
+        // `ANTHROPIC_PROXY_FORCE_STREAM` still wins, so it remains overridable
+        // for testing other providers without touching the settings file.
+        let force_stream_upstream = match std::env::var("ANTHROPIC_PROXY_FORCE_STREAM").ok() {
+            Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            None => settings.force_stream(&crate::providers::builtin_presets()),
+        };
 
         let mut model_map = if settings.model_map.trim().is_empty() {
             BTreeMap::new()
@@ -134,6 +150,7 @@ impl Config {
             models_config_url: preset.models_config_url,
             models_flavor,
             sanitize_fingerprints,
+            force_stream_upstream,
             ..Default::default()
         };
 

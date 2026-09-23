@@ -40,16 +40,7 @@ impl LogBuffer {
             entries.push(entry.clone());
         }
         // Mirror to ~/.proxy-rs/logs/proxy.log so history survives restarts.
-        if let Some(path) = log_file_path() {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, "{} [{}] {}", entry.ts, entry.level, entry.message);
-            }
-        }
+        append_log_line(&format!("{} [{}] {}", entry.ts, entry.level, entry.message));
     }
 
     /// Recent lines from the on-disk log (used to seed the buffer at startup).
@@ -89,15 +80,10 @@ impl LogBuffer {
     }
 }
 
+/// Local wall-clock timestamp for a log line: `YYYY-MM-DD HH:MM:SS.mmm`.
+/// Local here means the machine's timezone (`PROXY_TZ_OFFSET_HOURS` overrides).
 fn chrono_now() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{}.{:03}",
-        crate::util::format_epoch_secs(now.as_secs()),
-        now.subsec_millis()
-    )
+    crate::util::local_datetime_millis()
 }
 
 /// Default listen port; if taken at startup, the proxy falls back to +1.
@@ -126,6 +112,15 @@ pub struct GuiSettings {
     /// exposed in the GUI so it can be edited without restarting via env vars.
     #[serde(default)]
     pub sanitize_terms: String,
+    /// Whether the upstream only serves streaming bodies.
+    ///
+    /// `None` follows the provider preset's own `force_stream` flag (the
+    /// default, and what a newly added provider gets from `builtin_presets`);
+    /// `Some(true/false)` is the GUI switch, which also covers a custom URL
+    /// whose preset we do not know. When enabled, every request goes upstream
+    /// as a stream and a non-streaming client still gets one JSON body.
+    #[serde(default)]
+    pub force_stream: Option<bool>,
 }
 
 impl Default for GuiSettings {
@@ -141,6 +136,7 @@ impl Default for GuiSettings {
             model_map: String::new(),
             launch_at_login: false,
             sanitize_terms: String::new(),
+            force_stream: None,
         }
     }
 }
@@ -175,9 +171,64 @@ pub fn log_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Serializes log writes so concurrent request handlers cannot interleave
+/// half-written lines.
+///
+/// `writeln!` issues one `write` syscall per format fragment, so without an
+/// exclusive handle two tasks interleave half-written lines — exactly the torn
+/// output this guards against. The lock is held across the whole line (body +
+/// newline) so no other writer can split it.
+static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// Test hook: forces log mirroring to a temp file instead of the user's
+/// `~/.proxy-rs/logs/proxy.log`. Re-settable so two tests can each redirect it.
+static LOG_FILE_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn append_log_line(line: &str) {
+    let Some(path) = log_file_path() else {
+        return;
+    };
+    let mut guard = match LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_none() {
+        *guard = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+    }
+    if let Some(file) = guard.as_mut() {
+        use std::io::Write;
+        // Body and newline are written while holding the lock, so no other
+        // writer can land between them and tear the line.
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.write_all(b"\n");
+        let _ = file.flush();
+    }
+}
+
 /// Rolling log file: `~/.proxy-rs/logs/proxy.log`.
 pub fn log_file_path() -> Option<PathBuf> {
+    if let Ok(guard) = LOG_FILE_OVERRIDE.lock() {
+        if let Some(p) = guard.as_ref() {
+            return Some(p.clone());
+        }
+    }
     Some(log_dir()?.join("proxy.log"))
+}
+
+/// Point log mirroring at `path` for the rest of the process (tests only).
+#[cfg(test)]
+fn set_log_file_override(path: PathBuf) {
+    // Drop any handle pointing at the previous location.
+    if let Ok(mut g) = LOG_FILE.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = LOG_FILE_OVERRIDE.lock() {
+        *g = Some(path);
+    }
 }
 
 impl GuiSettings {
@@ -229,6 +280,16 @@ impl GuiSettings {
             .clone()
     }
 
+    /// Whether upstream requests must be sent as a stream.
+    ///
+    /// The GUI switch wins when set; otherwise the provider preset decides.
+    /// A custom URL keeps plain semantics unless the user flips the switch or
+    /// the runtime `11101` detector discovers it.
+    pub fn force_stream(&self, presets: &[crate::providers::ProviderPreset]) -> bool {
+        self.force_stream
+            .unwrap_or_else(|| crate::providers::preset_force_stream(presets, &self.provider_id))
+    }
+
     pub fn models_preset(&self) -> crate::providers::ProviderPreset {
         let presets = crate::providers::builtin_presets();
         presets
@@ -260,6 +321,28 @@ pub fn normalize_chat_url(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Terminator for the long bodies in the concurrency test, so a line that
+    /// got cut short is detectable rather than looking merely shorter.
+    const END_MARKER: &str = " |end|";
+
+    /// The log destination is process-global, so tests that assert on the file
+    /// must not run concurrently with each other.
+    static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Redirect log mirroring to a temp file so tests never touch (or fill)
+    /// the user's real `~/.proxy-rs/logs/proxy.log`.
+    ///
+    /// Returns the temp path plus a guard held for the duration of the test.
+    fn use_temp_log_file(name: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = LOG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("proxy-rs-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        set_log_file_override(path.clone());
+        (path, guard)
+    }
+
     #[test]
     fn normalize_full_url() {
         assert_eq!(
@@ -285,7 +368,64 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_pushes_never_interleave_lines() {
+        let (log_path, _guard) = use_temp_log_file("concurrent.log");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let expected = 40 * 50;
+        rt.block_on(async {
+            let buf = LogBuffer::new(expected + 500);
+            let mut tasks = Vec::new();
+            let buf = std::sync::Arc::new(buf);
+            for i in 0..40 {
+                let buf = buf.clone();
+                tasks.push(tokio::spawn(async move {
+                    for j in 0..50 {
+                        // A long body makes a torn write obvious, and the
+                        // trailing marker makes a truncated one obvious.
+                        let body = format!("{}{}", "x".repeat(300), END_MARKER);
+                        buf.push("INFO", format!("task {i} line {j} {body}")).await;
+                    }
+                }));
+            }
+            for t in tasks {
+                let _ = t.await;
+            }
+
+            // The buffer is seeded from the log file, which other tests share,
+            // so only this test's own lines are asserted on.
+            let mine: Vec<_> = buf
+                .snapshot()
+                .await
+                .into_iter()
+                .filter(|e| e.message.starts_with("task "))
+                .collect();
+            assert_eq!(mine.len(), expected);
+            for entry in &mine {
+                let msg = &entry.message;
+                assert!(msg.ends_with(END_MARKER), "truncated line: {msg:?}");
+                assert!(msg.len() > 300, "shortened line: {msg:?}");
+            }
+        });
+
+        // The real regression was on disk: every written line must carry
+        // exactly one "[INFO] " marker and end with this test's body. A torn
+        // line splices two writes together and therefore shows two markers.
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let mine: Vec<&str> = text.lines().filter(|l| l.contains("task ")).collect();
+        assert_eq!(mine.len(), expected, "expected every push to reach disk");
+        for line in mine {
+            assert_eq!(
+                line.matches(" [INFO] ").count(),
+                1,
+                "torn log line: {line:?}"
+            );
+            assert!(line.ends_with(END_MARKER), "truncated log line: {line:?}");
+        }
+    }
+
+    #[test]
     fn log_buffer_trims_to_capacity() {
+        let (_path, _guard) = use_temp_log_file("capacity.log");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let buf = LogBuffer::new(3);
@@ -297,5 +437,60 @@ mod tests {
             assert_eq!(snap[0].message, "line 7");
             assert_eq!(snap[2].message, "line 9");
         });
+    }
+
+    #[test]
+    fn unset_force_stream_follows_the_provider_preset() {
+        let presets = crate::providers::builtin_presets();
+        let mut s = GuiSettings::default();
+        assert_eq!(s.force_stream, None, "default must follow the preset");
+
+        s.provider_id = "workbuddy-cn".to_string();
+        assert!(s.force_stream(&presets));
+
+        s.provider_id = "openai".to_string();
+        assert!(!s.force_stream(&presets));
+
+        // A provider with no preset (custom URL) keeps plain semantics.
+        s.provider_id = "custom-gateway".to_string();
+        assert!(!s.force_stream(&presets));
+    }
+
+    #[test]
+    fn gui_switch_overrides_the_preset_in_both_directions() {
+        let presets = crate::providers::builtin_presets();
+
+        // Turn streaming ON for a provider that serves plain bodies.
+        let mut s = GuiSettings {
+            provider_id: "openai".to_string(),
+            force_stream: Some(true),
+            ..Default::default()
+        };
+        assert!(s.force_stream(&presets));
+
+        // ...and OFF for one whose preset forces it.
+        s.provider_id = "workbuddy-cn".to_string();
+        s.force_stream = Some(false);
+        assert!(!s.force_stream(&presets));
+    }
+
+    #[test]
+    fn force_stream_survives_a_settings_round_trip() {
+        let s = GuiSettings {
+            force_stream: Some(true),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: GuiSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.force_stream, Some(true));
+
+        // Older settings files have no such key: they must load as "follow the
+        // preset" rather than failing to deserialize.
+        let legacy: GuiSettings = serde_json::from_str(
+            r#"{"provider_id":"workbuddy-cn","custom_url":"","api_key":"","port":3456,"bind":"127.0.0.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.force_stream, None);
+        assert!(legacy.force_stream(&crate::providers::builtin_presets()));
     }
 }
