@@ -69,10 +69,6 @@ if (window.__TAURI__ && window.__TAURI__.event) {
   });
 }
 
-// Quick navigation buttons
-document.getElementById('btn-goto-logs')?.addEventListener('click', () => switchTab('logs'));
-document.getElementById('btn-goto-settings')?.addEventListener('click', () => switchTab('settings'));
-
 // ── Service Controls ───────────────────────────────────────────
 const btnToggleService = document.getElementById('btn-toggle-service');
 btnToggleService.addEventListener('click', async () => {
@@ -86,7 +82,7 @@ btnToggleService.addEventListener('click', async () => {
     await refreshStatus();
   } catch (err) {
     console.error('Toggle service failed:', err);
-    alert('操作失败: ' + err);
+    toast('操作失败: ' + err, 'error');
   } finally {
     btnToggleService.disabled = false;
   }
@@ -236,23 +232,17 @@ function setLogsViewMode(mode) {
   
   const tableView = document.getElementById('table-view');
   const consoleView = document.getElementById('console-view');
-  const autorefreshLabel = document.getElementById('table-autorefresh-label');
-  const btnRefresh = document.getElementById('btn-refresh-table');
-  const btnClearDb = document.getElementById('btn-clear-db-logs');
+  const tableFilterRow = document.getElementById('table-filter-row');
 
   if (mode === 'table') {
+    if (tableFilterRow) tableFilterRow.style.display = 'flex';
     if (tableView) tableView.style.display = 'flex';
     if (consoleView) consoleView.style.display = 'none';
-    if (autorefreshLabel) autorefreshLabel.style.display = 'flex';
-    if (btnRefresh) btnRefresh.style.display = 'inline-block';
-    if (btnClearDb) btnClearDb.style.display = 'inline-block';
     fetchRequestLogs();
   } else {
+    if (tableFilterRow) tableFilterRow.style.display = 'none';
     if (tableView) tableView.style.display = 'none';
     if (consoleView) consoleView.style.display = 'flex';
-    if (autorefreshLabel) autorefreshLabel.style.display = 'none';
-    if (btnRefresh) btnRefresh.style.display = 'none';
-    if (btnClearDb) btnClearDb.style.display = 'none';
     fetchLogs();
   }
 }
@@ -271,18 +261,15 @@ tableStatusFilter?.addEventListener('change', () => fetchRequestLogs(true));
 tableStreamedFilter?.addEventListener('change', () => fetchRequestLogs(true));
 tableClientFilter?.addEventListener('change', () => fetchRequestLogs(true));
 
-document.getElementById('btn-refresh-table')?.addEventListener('click', () => {
-  fetchRequestLogs(false);
-});
-
 document.getElementById('btn-clear-db-logs')?.addEventListener('click', async () => {
-  if (confirm('确定要清空数据库中的所有请求记录吗？此操作不可恢复。')) {
-    try {
-      await invoke('clear_request_logs');
-      fetchRequestLogs(true);
-    } catch (e) {
-      alert('清空失败: ' + e);
-    }
+  const ok = await confirmAction('确定要清空数据库中的所有请求记录吗？此操作不可恢复。', '清空请求记录');
+  if (!ok) return;
+  try {
+    await invoke('clear_request_logs');
+    fetchRequestLogs(true);
+    toast('请求记录已清空');
+  } catch (e) {
+    toast('清空失败: ' + e, 'error');
   }
 });
 
@@ -411,12 +398,12 @@ function renderRequestLogs() {
       const sessionCell = item.session_id
         ? `<div class="cell-session-box">
              <span class="badge-pill client-pill client-${escapeHtml(item.client || 'unknown')}">${escapeHtml(item.client || 'unknown')}</span>
-             <span class="cell-session" title="${escapeHtml(item.session_id)}">${escapeHtml(shortSessionId(item.session_id))}</span>
+             <span class="cell-session" title="${escapeHtml(item.session_id)}">${escapeHtml(shortSessionId(item.session_id, item.client))}</span>
            </div>`
         : `<span class="cell-session-none">—</span>`;
 
       return `<tr class="${rowClass}">
-        <td class="cell-time">${escapeHtml(item.created_at)}</td>
+        <td class="cell-time" title="${escapeHtml(item.created_at)}">${escapeHtml(shortTime(item.created_at))}</td>
         <td>${sessionCell}</td>
         <td>
           <div class="cell-model-box">
@@ -464,16 +451,34 @@ function renderRequestLogs() {
   });
 }
 
-// `codex:01a0cc30-3318-74d2-b045-650a0b0c2e1c` -> `codex:01a0cc30`.
+// `codex:01a0cc30-3318-74d2-b045-650a0b0c2e1c` -> `01a0cc30`.
+// The client prefix is dropped on purpose: the table cell already renders a
+// client pill (e.g. "claude"/"codex") right next to this id, so keeping the
+// `client:` prefix would print the client name twice for no added information.
 // The full value stays in the cell's `title`, and in the log file.
-function shortSessionId(sessionId) {
+function shortSessionId(sessionId, client) {
   if (!sessionId) return '';
   const idx = sessionId.indexOf(':');
   if (idx < 0) return sessionId;
   const prefix = sessionId.slice(0, idx);
   const rest = sessionId.slice(idx + 1);
   const head = rest.split('-')[0] || rest;
-  return `${prefix}:${head.length < rest.length ? head : rest}`;
+  const short = head.length < rest.length ? head : rest;
+  // Only show the prefix when it isn't the same as the client pill already
+  // displayed beside this id.
+  if (client && prefix === client) return short;
+  return `${prefix}:${short}`;
+}
+
+// `2026-09-23 15:36:53.798` -> `15:36:53`.
+// Milliseconds and the date are noise in a request list; the date is almost
+// always today, and the full value stays in the cell's `title` and the detail
+// modal. Dropping them is what lets the column be narrow enough to leave room
+// for the model column.
+function shortTime(createdAt) {
+  if (!createdAt) return '';
+  const match = /(\d{2}:\d{2}:\d{2})/.exec(createdAt);
+  return match ? match[1] : createdAt;
 }
 
 function formatDuration(ms) {
@@ -552,14 +557,99 @@ document.getElementById('request-modal-overlay')?.addEventListener('click', (e) 
   }
 });
 
+// ── Confirm & Toast ────────────────────────────────────────────
+// `window.confirm` and `window.alert` are not implemented by the Tauri webview:
+// they return without showing anything, so every guarded action silently did
+// nothing. These replace them.
+
+let confirmResolve = null;
+
+/// Ask the user to confirm a destructive action. Resolves true/false.
+function confirmAction(message, title = '确认') {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-message').textContent = message;
+  const overlay = document.getElementById('confirm-overlay');
+  overlay.classList.add('active');
+  document.getElementById('btn-confirm-ok')?.focus();
+
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+  });
+}
+
+function settleConfirm(result) {
+  document.getElementById('confirm-overlay')?.classList.remove('active');
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (resolve) resolve(result);
+}
+
+document.getElementById('btn-confirm-ok')?.addEventListener('click', () => settleConfirm(true));
+document.getElementById('btn-confirm-cancel')?.addEventListener('click', () => settleConfirm(false));
+document.getElementById('confirm-overlay')?.addEventListener('click', (e) => {
+  // Clicking the backdrop cancels, matching the detail modal's behaviour.
+  if (e.target.id === 'confirm-overlay') settleConfirm(false);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && confirmResolve) settleConfirm(false);
+});
+
+/// Transient feedback. `kind` is 'ok' or 'error'.
+/// `action`, when provided, renders a button in the toast (e.g. a confirm step);
+/// it receives the toast element so it can dismiss it after running.
+function toast(message, kind = 'ok', action = null) {
+  const host = document.getElementById('toast-host');
+  if (!host) return;
+  const el = document.createElement('div');
+  el.className = `toast toast-${kind}`;
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  let timer = null;
+  const dismiss = () => {
+    if (timer) clearTimeout(timer);
+    el.remove();
+  };
+  if (action && action.label) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toast-action';
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => {
+      if (action.onClick) action.onClick(dismiss);
+    });
+    el.appendChild(btn);
+    // Confirm toasts stay a bit longer to give the user time to act.
+    timer = setTimeout(dismiss, action.timeout || 5000);
+  } else {
+    timer = setTimeout(dismiss, 3000);
+  }
+  host.appendChild(el);
+}
+
 // Console Fallback Logs
 logLevelFilter?.addEventListener('change', renderLogs);
 logSearchInput?.addEventListener('input', renderLogs);
 
-document.getElementById('btn-clear-logs')?.addEventListener('click', async () => {
-  await invoke('clear_logs');
-  appState.logs = [];
-  renderLogs();
+document.getElementById('btn-clear-logs')?.addEventListener('click', () => {
+  // Confirm via toast: the console is cleared only when the user taps 确认,
+  // so an accidental click can't wipe the visible logs.
+  toast('确定清空控制台日志？', 'ok', {
+    label: '确认',
+    timeout: 5000,
+    onClick: async (dismiss) => {
+      try {
+        await invoke('clear_logs');
+        appState.logs = [];
+        renderLogs();
+        dismiss();
+        toast('控制台已清空');
+      } catch (e) {
+        dismiss();
+        toast('清空失败: ' + e, 'error');
+      }
+    },
+  });
 });
 
 document.getElementById('btn-reveal-logs')?.addEventListener('click', () => {
@@ -810,6 +900,7 @@ loadCodexConfig();
 
 // Test upstream
 async function handleTestUpstream(resultContainer) {
+  if (!resultContainer) return;
   resultContainer.textContent = '正在向上游发起测试请求...';
   resultContainer.className = 'test-result';
   try {
@@ -827,12 +918,10 @@ async function handleTestUpstream(resultContainer) {
   }
 }
 
-document.getElementById('btn-test-upstream-quick')?.addEventListener('click', () => {
-  handleTestUpstream(document.getElementById('quick-test-result'));
-});
 document.getElementById('btn-test-upstream-settings')?.addEventListener('click', () => {
-  handleTestUpstream(document.getElementById('quick-test-result'));
-  switchTab('overview');
+  // Run in place: the result renders on the settings page itself instead of
+  // jumping back to the overview.
+  handleTestUpstream(document.getElementById('settings-test-result'));
 });
 
 // ── Command Palette (⌘K) ───────────────────────────────────────
@@ -845,7 +934,7 @@ const paletteActions = [
   { label: '查看日志 (Logs)', kbd: '2', action: () => switchTab('logs') },
   { label: '服务设置 (Settings)', kbd: '3', action: () => switchTab('settings') },
   { label: '启动/暂停代理服务', kbd: 'S', action: () => btnToggleService.click() },
-  { label: '测试上游连通性', kbd: 'T', action: () => handleTestUpstream(document.getElementById('quick-test-result')) },
+  { label: '测试上游连通性', kbd: 'T', action: () => { switchTab('settings'); handleTestUpstream(document.getElementById('settings-test-result')); } },
   { label: '清空日志记录', kbd: 'C', action: () => document.getElementById('btn-clear-logs')?.click() },
   { label: '打开系统日志目录', kbd: 'O', action: () => invoke('open_logs_dir') },
 ];

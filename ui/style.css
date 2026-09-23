@@ -76,7 +76,10 @@ code, pre, .mono {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 16px;
+  /* Left inset clears the macOS traffic-light cluster (close/min/max) that the
+     Overlay title-bar style floats over this header. The bar stays a drag
+     region across its full width, so only the content shifts right. */
+  padding: 10px 16px 10px 76px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   -webkit-app-region: drag; /* Allows dragging native window by header */
@@ -331,12 +334,25 @@ code, pre, .mono {
 .test-result.err { color: var(--error); }
 
 /* ── Logs Tab ─────────────────────────────────────────────────── */
+/* Row 1: shared by both log views — the view toggle and 日志目录 sit together
+   on the left. */
 .logs-toolbar {
   display: flex;
   align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+/* Row 2 for the table view: filters on the left, table actions pushed to the
+   right. Mirrors .console-subbar so both log views have the same two-row
+   shape (toggle row, then filter/action row). */
+.logs-filter-row {
+  display: flex;
+  align-items: center;
   justify-content: space-between;
-  margin-bottom: 10px;
   gap: 10px;
+  margin-bottom: 10px;
   flex-wrap: wrap;
 }
 
@@ -347,11 +363,15 @@ code, pre, .mono {
   flex-wrap: wrap;
 }
 
+/* Count + 实时刷新 + 清空记录, kept together and pushed to the right edge of
+   the filter row (margin-left:auto also right-aligns it if it wraps onto its
+   own line). */
 .logs-actions {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  margin-left: auto;
 }
 
 .view-mode-group {
@@ -420,7 +440,7 @@ code, pre, .mono {
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 170px);
+  height: calc(100vh - 210px);
   min-height: 260px;
 }
 
@@ -435,6 +455,11 @@ code, pre, .mono {
   border-collapse: collapse;
   text-align: left;
   font-size: 12px;
+  /* Fixed layout strictly honors the <th> widths below, so the 会话 column
+     keeps its 170px and the model column (which has no width) absorbs the
+     slack. Without this, `table-layout: auto` re-balances and squeezes the
+     session column below its min-width on narrow windows. */
+  table-layout: fixed;
 }
 
 .data-table thead th {
@@ -485,7 +510,10 @@ code, pre, .mono {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-width: 240px;
+  /* The model id and the route below it are the widest useful cell; let the
+     table give this column the slack the narrow time/session columns free up. */
+  min-width: 0;
+  max-width: 420px;
 }
 
 .cell-model {
@@ -502,13 +530,21 @@ code, pre, .mono {
   font-size: 10px;
   color: var(--muted);
   font-family: var(--mono);
+  /* `/model` and friends must not be clipped: no ellipsis here, the column
+     width is what keeps it readable. */
+  white-space: nowrap;
+  overflow: visible;
 }
 
+/* The session column must keep a hard floor so the client pill (e.g. "claude")
+   and the short session id never get squeezed into an ellipsis on narrow
+   windows. The model column already carries the slack (max-width + ellipsis),
+   so it absorbs the squeeze instead of this one. */
 .cell-session-box {
   display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 150px;
+  min-width: 170px;
 }
 
 .cell-session {
@@ -518,6 +554,9 @@ code, pre, .mono {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Required so the flex item can shrink to its ellipsis instead of pushing
+     the column wider than its min-width. */
+  min-width: 0;
 }
 
 .cell-session-none {
@@ -657,7 +696,7 @@ code, pre, .mono {
 .logs-console-view {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 170px);
+  height: calc(100vh - 210px);
   min-height: 260px;
 }
 
@@ -763,9 +802,81 @@ code, pre, .mono {
 .modal-footer {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   padding: 10px 18px;
   border-top: 1px solid var(--border);
   background: var(--surface2);
+}
+
+/* Confirmation dialog: narrower than the detail modal, since it carries one
+   question and two buttons. */
+.confirm-card {
+  width: 380px;
+}
+
+.confirm-card .modal-body {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* Toasts: transient feedback, stacked bottom-right so they do not cover the
+   toolbar the action came from. */
+.toast-host {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 2000;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  min-width: 200px;
+  max-width: 360px;
+  padding: 9px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: var(--shadow);
+  animation: toast-in .16s ease-out;
+}
+
+.toast.toast-ok {
+  border-left: 3px solid var(--success);
+}
+
+.toast.toast-error {
+  border-left: 3px solid var(--error);
+}
+
+/* Action button inside a toast (e.g. a confirm step). Sits to the right of the
+   message; the host already sets pointer-events: none, so this re-enables
+   clicks on the button itself. */
+.toast-action {
+  margin-left: 12px;
+  padding: 3px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.toast-action:hover {
+  background: var(--accent-hover);
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .detail-table {

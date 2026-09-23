@@ -994,6 +994,53 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_file_backed_database_actually_removes_the_rows() {
+        // Regression: `clear_request_logs` now borrows through the read pool, so
+        // it must still delete from the same database the writer thread fills.
+        // The in-memory test cannot cover this — it shares a single connection.
+        let dir = std::env::temp_dir().join(format!("proxy-rs-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.db");
+        let db = StatsDb::open_at(&path).unwrap();
+
+        for _ in 0..5 {
+            db.record_request_log(outcome(
+                "m",
+                "/v1/messages",
+                &TokenRecord::default(),
+                200,
+                None,
+                true,
+            ))
+            .unwrap();
+        }
+
+        // Wait for the writer thread to commit before clearing.
+        let mut total = 0;
+        for _ in 0..200 {
+            total = db.query_today().unwrap().requests_total;
+            if total == 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(total, 5, "rows should be committed before the clear");
+
+        db.clear_request_logs().unwrap();
+
+        assert_eq!(
+            db.query_today().unwrap().requests_total,
+            0,
+            "the delete must be visible to a subsequent read"
+        );
+        let listed = db.query_request_logs(&RequestLogFilter::default()).unwrap();
+        assert_eq!(listed.total, 0, "and to the request-log listing");
+        assert!(listed.items.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migration_drops_legacy_daily_stats_and_backfills_dates() {
         // Simulate a database written by the previous schema: no `date` column,
         // plus the now-redundant `daily_stats` table.

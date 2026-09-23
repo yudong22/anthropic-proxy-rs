@@ -26,7 +26,7 @@
             <path fill="url(#logo-g)" transform="matrix(1.2 0 0 1.2 157 125)" d="M75 0L0 90L67.5 90L60 150L135 60L67.5 60L75 0Z"/>
           </svg>
           <span class="logo-text">Anthropic Proxy</span>
-          <span class="logo-ver" id="app-version">v1.5.0</span>
+          <span class="logo-ver" id="app-version">v1.5.1</span>
         </div>
       </div>
       <div class="header-right">
@@ -118,21 +118,22 @@
           <dd><span id="overview-lal">未启用</span></dd>
         </dl>
       </div>
-
-      <div class="section">
-        <div class="section-title">快捷操作</div>
-        <div class="actions-row">
-          <button class="btn" id="btn-test-upstream-quick">⚡️ 测试上游连通性</button>
-          <button class="btn" id="btn-goto-logs">📋 查看运行日志</button>
-          <button class="btn" id="btn-goto-settings">⚙️ 修改代理配置</button>
-        </div>
-        <div class="test-result" id="quick-test-result"></div>
-      </div>
     </main>
 
     <!-- Tab 2: Logs -->
     <main class="tab-content" id="tab-logs">
+      <!-- Row 1 (shared by both views): view toggle + log-directory shortcut. -->
       <div class="logs-toolbar">
+        <div class="view-mode-group">
+          <button type="button" class="btn-toggle active" id="view-mode-table" title="表格视图">表格</button>
+          <button type="button" class="btn-toggle" id="view-mode-console" title="原始控制台日志">控制台</button>
+        </div>
+        <button class="btn btn-small" id="btn-reveal-logs" title="在访达中显示日志文件">日志目录</button>
+      </div>
+
+      <!-- Row 2 (table view): filters on the left, table actions on the right,
+           mirroring the console subbar's layout. -->
+      <div class="logs-filter-row" id="table-filter-row">
         <div class="logs-filter-group">
           <select id="table-model-filter" class="log-select" title="按模型筛选">
             <option value="all">全部模型</option>
@@ -153,19 +154,13 @@
             <option value="all">全部会话</option>
           </select>
           <input type="text" id="table-search-input" class="log-input" placeholder="搜索模型/路由/会话/错误...">
-          <span class="log-count" id="table-log-count">0 条记录</span>
         </div>
         <div class="logs-actions">
-          <div class="view-mode-group">
-            <button type="button" class="btn-toggle active" id="view-mode-table" title="表格视图">表格</button>
-            <button type="button" class="btn-toggle" id="view-mode-console" title="原始控制台日志">控制台</button>
-          </div>
+          <span class="log-count" id="table-log-count">0 条记录</span>
           <label class="auto-scroll-label" id="table-autorefresh-label">
             <input type="checkbox" id="table-autorefresh" checked> 实时刷新
           </label>
-          <button class="btn btn-small" id="btn-refresh-table" title="刷新表格">🔄 刷新</button>
           <button class="btn btn-small btn-danger" id="btn-clear-db-logs" title="清空数据库记录">清空记录</button>
-          <button class="btn btn-small" id="btn-reveal-logs" title="在访达中显示日志文件">日志目录</button>
         </div>
       </div>
 
@@ -175,9 +170,9 @@
           <table class="data-table" id="request-logs-table">
             <thead>
               <tr>
-                <th style="width: 150px;">时间</th>
-                <th style="width: 150px;">会话</th>
-                <th>模型 ID</th>
+                <th style="width: 80px;">时间</th>
+                <th style="width: 80px;">会话</th>
+                <th>模型 ID / 路径</th>
                 <th style="width: 90px; text-align: right;">Input</th>
                 <th style="width: 90px; text-align: right;">Output</th>
                 <th style="width: 95px; text-align: right;">Duration</th>
@@ -247,6 +242,8 @@
             <button type="button" class="btn btn-small" id="btn-fetch-models">🔍 拉取可用模型</button>
             <button type="button" class="btn btn-small" id="btn-test-upstream-settings">⚡️ 测试连接</button>
           </div>
+          <!-- Connection test result renders here, on the settings page itself. -->
+          <div class="test-result" id="settings-test-result"></div>
           <div id="models-container" class="models-container"></div>
         </fieldset>
 
@@ -370,6 +367,25 @@
       </div>
     </div>
   </div>
+
+  <!-- Confirmation Dialog (replaces window.confirm, which the Tauri webview
+       does not implement: it returns without showing anything, so a guarded
+       action silently never runs). -->
+  <div class="modal-overlay" id="confirm-overlay">
+    <div class="modal-card confirm-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="confirm-title">确认</h3>
+      </div>
+      <div class="modal-body" id="confirm-message"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-small" id="btn-confirm-cancel">取消</button>
+        <button type="button" class="btn btn-small btn-danger" id="btn-confirm-ok">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast host: transient feedback for actions with no dialog of their own. -->
+  <div class="toast-host" id="toast-host"></div>
 
   <!-- Command Palette Modal (⌘K) -->
   <div class="palette-overlay" id="palette-overlay">
