@@ -44,6 +44,10 @@ pub fn format_headers(headers: &HeaderMap) -> String {
 }
 
 /// Header names whose value is a credential and must not be logged verbatim.
+///
+/// Matched exactly (case-insensitively) or by the `contains` rule below — see
+/// [`is_sensitive_header`]. Providers do not agree on a single spelling, so the
+/// common vendor variants are listed rather than relying on one canonical name.
 const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -51,20 +55,52 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "api-key",
     "x-auth-token",
     "cookie",
+    "set-cookie",
+    "x-goog-api-key",
+    "openai-api-key",
+    "anthropic-api-key",
+    "x-anthropic-api-key",
+    "x-api-token",
 ];
+
+/// Substrings that mark a header as credential-bearing even when the exact name
+/// is not listed (`x-some-vendor-api-key`, `x-foo-token`, …).
+const SENSITIVE_NAME_FRAGMENTS: &[&str] = &["api-key", "apikey", "auth-token", "access-token"];
+
+fn is_sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if SENSITIVE_HEADERS.contains(&name.as_str()) {
+        return true;
+    }
+    if name.ends_with("-token") || name.ends_with("-secret") {
+        return true;
+    }
+    SENSITIVE_NAME_FRAGMENTS.iter().any(|f| name.contains(f))
+}
 
 /// Mask a credential, keeping a short prefix for identification.
 ///
 /// `Bearer ck_abc…` keeps its scheme so the line still reads naturally; a bare
-/// token keeps its first few characters. Anything short enough that a prefix
-/// would give the value away is masked entirely.
+/// token keeps a very short prefix. The prefix is deliberately small and the
+/// value is masked entirely when that prefix would be a meaningful fraction of
+/// the secret — these lines end up in `proxy.log`, which is routinely attached
+/// to bug reports.
 fn redact_header_value(name: &str, value: &str) -> String {
-    if !SENSITIVE_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+    if !is_sensitive_header(name) {
         return value.to_string();
     }
 
+    // Any `<scheme> <secret>` form: `Bearer …`, `Basic …`, `ApiKey …`, `SSWS …`.
+    // Only a leading token followed by whitespace is treated as a scheme; a
+    // bare secret containing spaces keeps its whitespace inside the mask.
     let (scheme, secret) = match value.split_once(' ') {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => {
+        Some((scheme, rest))
+            if !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && rest.contains(|c: char| !c.is_whitespace()) =>
+        {
             (Some(scheme), rest.trim())
         }
         _ => (None, value.trim()),
@@ -72,8 +108,8 @@ fn redact_header_value(name: &str, value: &str) -> String {
 
     // Below this length a visible prefix would be a meaningful fraction of the
     // secret, so show nothing at all.
-    const KEEP: usize = 8;
-    let masked = if secret.chars().count() > KEEP + 4 {
+    const KEEP: usize = 4;
+    let masked = if secret.chars().count() > KEEP + 8 {
         let prefix: String = secret.chars().take(KEEP).collect();
         format!("{prefix}…")
     } else {
@@ -281,13 +317,53 @@ mod tests {
         );
         assert!(!line.contains("secret-value-here"), "key leaked: {line}");
         assert!(
-            line.contains("Bearer ck_fm3j4…"),
-            "scheme+prefix kept: {line}"
+            line.contains("Bearer ck_f…"),
+            "scheme+short prefix kept: {line}"
         );
         assert!(
             line.contains("content-type: application/json"),
             "others intact"
         );
+    }
+
+    #[test]
+    fn format_headers_redacts_non_bearer_schemes_and_vendor_names() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("AIzaSyD-very-secret-google-key"),
+        );
+        headers.insert(
+            "x-vendor-access-token",
+            HeaderValue::from_static("vendor-token-value-123456"),
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Basic dXNlcjpwYXNzd29yZA=="),
+        );
+
+        let line = format_headers(&headers);
+
+        for secret in [
+            "SyD-very-secret-google-key",
+            "token-value-123456",
+            "dXNlcjpwYXNzd29yZA",
+        ] {
+            assert!(!line.contains(secret), "leaked {secret}: {line}");
+        }
+        assert!(line.contains("Basic "), "scheme kept: {line}");
+    }
+
+    #[test]
+    fn short_secrets_are_masked_entirely() {
+        use axum::http::HeaderValue;
+        // 12 chars: a visible prefix would be a meaningful fraction of it.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("shortsecret1"));
+        let line = format_headers(&headers);
+        assert!(!line.contains("short"), "leaked: {line}");
+        assert!(!line.contains("secret1"), "leaked: {line}");
     }
 
     #[test]

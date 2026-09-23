@@ -77,12 +77,15 @@ btnToggleService.addEventListener('click', async () => {
     if (appState.running) {
       await invoke('stop_service');
     } else {
+      // start_service now rejects when the port could not be bound, so a busy
+      // port surfaces here instead of being silently reported as success.
       await invoke('start_service');
     }
     await refreshStatus();
   } catch (err) {
     console.error('Toggle service failed:', err);
     toast('操作失败: ' + err, 'error');
+    await refreshStatus();
   } finally {
     btnToggleService.disabled = false;
   }
@@ -126,6 +129,11 @@ async function refreshStatus() {
       document.getElementById('overview-log-path').textContent = status.log_path;
     }
     document.getElementById('overview-lal').textContent = status.launch_at_login ? '已开启' : '未开启';
+    if (status.launch_at_login_stale) {
+      // Setting says yes but launchd has no job: the login item is dead and the
+      // app will not start at next login until it is re-armed.
+      document.getElementById('overview-lal').textContent = '已开启（未生效）';
+    }
   } catch (err) {
     console.error('refreshStatus error:', err);
   }
@@ -738,6 +746,8 @@ async function loadSettings() {
     document.getElementById('setting-completion-model').value = s.completion_model || '';
     document.getElementById('setting-model-map').value = s.model_map || '';
     document.getElementById('setting-sanitize-terms').value = s.sanitize_terms || '';
+    // Reflect the user's persisted intent; whether the job is actually live is
+    // reported separately by get_status as `launch_at_login_stale`.
     document.getElementById('setting-launch-at-login').checked = Boolean(s.launch_at_login);
 
     // A null switch means "follow the provider preset": show the effective

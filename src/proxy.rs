@@ -1763,80 +1763,95 @@ fn create_flavor_sse_stream(
                                 continue;
                             }
 
-                            if let Ok(mut chunk_obj) = serde_json::from_str::<openai::StreamChunk>(data) {
-                                if let Some(ref usage) = chunk_obj.usage {
-                                    capture_usage!(usage.clone());
-                                }
-
-                                match flavor {
-                                    ApiFlavor::Anthropic => {
-                                        if let Some(state) = anthropic_state.as_mut() {
-                                            for event in stream::translate_chunk(state, &chunk_obj) {
-                                                yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
-                                            }
-                                        }
+                            match serde_json::from_str::<openai::StreamChunk>(data) {
+                                Ok(mut chunk_obj) => {
+                                    if let Some(ref usage) = chunk_obj.usage {
+                                        capture_usage!(usage.clone());
                                     }
-                                    ApiFlavor::Responses => {
-                                        if let Some(state) = responses_state.as_mut() {
-                                            for event in responses_pipeline::translate_stream_chunk(state, &chunk_obj) {
-                                                yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
-                                            }
-                                        }
-                                    }
-                                    ApiFlavor::Chat => {
-                                        if chunk_obj.model.is_some() {
-                                            chunk_obj.model = Some(client_model.clone());
-                                        }
-                                        let serialized = serde_json::to_string(&chunk_obj)
-                                            .unwrap_or_else(|_| data.to_string());
-                                        yield Ok(Bytes::from(format!("data: {}\n\n", serialized)));
-                                    }
-                                }
-                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
-                                // Some upstreams emit a business error as a
-                                // `data:` line inside a 200 stream. Surface it
-                                // instead of silently dropping it.
-                                if val.get("code").is_some() {
-                                    let summary = describe_upstream_error(200, data);
-                                    let model = anthropic_state
-                                        .as_ref()
-                                        .map(|s| s.model().to_string())
-                                        .or_else(|| responses_state.as_ref().map(|s| s.model().to_string()))
-                                        .unwrap_or_else(|| client_model.clone());
-                                    let msg = format!(
-                                        "UPSTREAM ERROR [stream] model={} {} | {}",
-                                        model, tag, summary
-                                    );
-                                    gui_logs.push("ERROR", msg.clone()).await;
-                                    tracing::warn!("{}", msg);
 
                                     match flavor {
                                         ApiFlavor::Anthropic => {
-                                            for event in stream::translate_error(format!("Upstream error: {}", summary)) {
-                                                yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
-                                            }
-                                            break;
-                                        }
-                                        ApiFlavor::Responses => {
-                                            if let Some(state) = responses_state.as_ref() {
-                                                for event in responses_pipeline::translate_stream_error(
-                                                    state,
-                                                    format!("Upstream error: {}", summary),
-                                                ) {
+                                            if let Some(state) = anthropic_state.as_mut() {
+                                                for event in stream::translate_chunk(state, &chunk_obj) {
                                                     yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
                                                 }
                                             }
-                                            break;
+                                        }
+                                        ApiFlavor::Responses => {
+                                            if let Some(state) = responses_state.as_mut() {
+                                                for event in responses_pipeline::translate_stream_chunk(state, &chunk_obj) {
+                                                    yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
+                                                }
+                                            }
                                         }
                                         ApiFlavor::Chat => {
-                                            yield Ok(Bytes::from(format!("data: {}\n\n", data)));
+                                            if chunk_obj.model.is_some() {
+                                                chunk_obj.model = Some(client_model.clone());
+                                            }
+                                            let serialized = serde_json::to_string(&chunk_obj)
+                                                .unwrap_or_else(|_| data.to_string());
+                                            yield Ok(Bytes::from(format!("data: {}\n\n", serialized)));
                                         }
                                     }
-                                } else {
-                                    tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
                                 }
-                            } else {
-                                tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
+                                Err(e) => {
+                                    // Not a StreamChunk. Two cases matter.
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                                        // Some upstreams emit a business error as a
+                                        // `data:` line inside a 200 stream. Surface it
+                                        // instead of silently dropping it.
+                                        if val.get("code").is_some() {
+                                            let summary = describe_upstream_error(200, data);
+                                            let model = anthropic_state
+                                                .as_ref()
+                                                .map(|s| s.model().to_string())
+                                                .or_else(|| responses_state.as_ref().map(|s| s.model().to_string()))
+                                                .unwrap_or_else(|| client_model.clone());
+                                            let msg = format!(
+                                                "UPSTREAM ERROR [stream] model={} {} | {}",
+                                                model, tag, summary
+                                            );
+                                            gui_logs.push("ERROR", msg.clone()).await;
+                                            tracing::warn!("{}", msg);
+
+                                            match flavor {
+                                                ApiFlavor::Anthropic => {
+                                                    for event in stream::translate_error(format!("Upstream error: {}", summary)) {
+                                                        yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
+                                                    }
+                                                    break;
+                                                }
+                                                ApiFlavor::Responses => {
+                                                    if let Some(state) = responses_state.as_ref() {
+                                                        for event in responses_pipeline::translate_stream_error(
+                                                            state,
+                                                            format!("Upstream error: {}", summary),
+                                                        ) {
+                                                            yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                                ApiFlavor::Chat => {
+                                                    yield Ok(Bytes::from(format!("data: {}\n\n", data)));
+                                                }
+                                            }
+                                        } else {
+                                            tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
+                                        }
+                                    } else if data.contains("\"usage\"") {
+                                        // A usage frame must never vanish without a
+                                        // trace: dropping it here silently recorded
+                                        // the request with zero tokens.
+                                        gui_logs.push("WARN", format!(
+                                            "忽略无法解析的 usage 数据帧 ({}): {}",
+                                            e,
+                                            crate::util::truncate(data, 200)
+                                        )).await;
+                                    } else {
+                                        tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
+                                    }
+                                }
                             }
                         }
                     }

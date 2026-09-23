@@ -120,8 +120,25 @@ mod tests {
 
     #[tokio::test]
     async fn bind_falls_back_only_when_explicitly_asked() {
-        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = held.local_addr().unwrap().port();
+        // The fallback port is `preferred + 1`, so the test needs a pair where
+        // the second port is genuinely free. Asking the OS for an ephemeral
+        // port and assuming `port + 1` is unused is racy: another test or
+        // process can hold it, and the assertion then fails intermittently.
+        let (_held, port) = loop {
+            let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = held.local_addr().unwrap().port();
+            if port == u16::MAX {
+                continue;
+            }
+            // Probe the neighbour, then release it so `bind` can take it.
+            match tokio::net::TcpListener::bind(("127.0.0.1", port + 1)).await {
+                Ok(probe) => {
+                    drop(probe);
+                    break (held, port);
+                }
+                Err(_) => continue,
+            }
+        };
 
         let (_listener, bound) = ServiceController::bind("127.0.0.1", port, true)
             .await

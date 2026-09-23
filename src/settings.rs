@@ -347,24 +347,57 @@ fn flush_log_writer() {
 static LOG_FILE_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// Rolling log file: `~/.proxy-rs/logs/proxy.log`.
+///
+/// Under `cargo test` this defaults to a per-process temp file. Many unit tests
+/// build a `LogBuffer` and push request-shaped lines through the real handlers;
+/// without the redirect those synthetic lines append to the developer's real,
+/// long-lived `~/.proxy-rs/logs/proxy.log`, which is both confusing and (for
+/// tests that log credential-shaped values) a place secrets should never land.
+/// Tests that need a specific file call [`set_log_file_override`], which still
+/// wins.
 pub fn log_file_path() -> Option<PathBuf> {
     if let Ok(guard) = LOG_FILE_OVERRIDE.lock() {
         if let Some(p) = guard.as_ref() {
             return Some(p.clone());
         }
     }
+    if cfg!(test) {
+        return Some(test_log_path());
+    }
     Some(log_dir()?.join("proxy.log"))
+}
+
+/// Default log destination while running tests: one file per process, in the
+/// temp directory, so parallel test binaries cannot share a file.
+///
+/// Not `#[cfg(test)]`-gated so `cfg!(test)` above still compiles in the normal
+/// build; it is simply never called there.
+fn test_log_path() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("proxy-rs-logs-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("proxy.test.log")
 }
 
 /// Point log mirroring at `path` (tests only).
 ///
 /// Only effective while no line has been written yet: the writer thread opens
 /// its handle once and keeps it, so a later redirect cannot move an open file.
-#[cfg(test)]
-fn set_log_file_override(path: PathBuf) {
+///
+/// Exported (but hidden) so integration tests in `tests/` — which are separate
+/// crates and cannot see `#[cfg(test)]` items — can keep their log lines out of
+/// the developer's real `~/.proxy-rs/logs/proxy.log`. Without this an
+/// integration test that exercises a logging handler silently appends its
+/// synthetic credentials to a real, long-lived file.
+#[doc(hidden)]
+pub fn set_log_file_override_for_tests(path: PathBuf) {
     if let Ok(mut g) = LOG_FILE_OVERRIDE.lock() {
         *g = Some(path);
     }
+}
+
+#[cfg(test)]
+fn set_log_file_override(path: PathBuf) {
+    set_log_file_override_for_tests(path);
 }
 
 impl GuiSettings {

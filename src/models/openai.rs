@@ -95,6 +95,19 @@ pub struct Function {
     pub parameters: Value,
 }
 
+/// Deserialize `T`, treating an explicit JSON `null` as `T::default()`.
+///
+/// `#[serde(default)]` only covers a *missing* key. An upstream that sends
+/// `"usage": null` still fails the field, which on the non-streaming path
+/// becomes a 500 for an otherwise valid response.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// OpenAI API response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIResponse {
@@ -107,7 +120,7 @@ pub struct OpenAIResponse {
     #[serde(default)]
     pub model: Option<String>,
     pub choices: Vec<Choice>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
@@ -132,8 +145,16 @@ pub struct ChoiceMessage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
+    // Providers omit token fields freely (some send only `total_tokens`).
+    // Without a default, a single missing field fails the whole response: on the
+    // non-streaming path that becomes a 500, and on the streaming path
+    // `serde_json::from_str::<StreamChunk>` returns Err, which is swallowed —
+    // the usage chunk is dropped and the request is recorded with zero tokens.
+    #[serde(default)]
     pub prompt_tokens: u32,
+    #[serde(default)]
     pub completion_tokens: u32,
+    #[serde(default)]
     pub total_tokens: u32,
     /// OpenAI-compatible breakout of cached prompt tokens, if the upstream
     /// reports it. Mapped to Anthropic `cache_read_input_tokens`.
@@ -283,4 +304,52 @@ pub struct DeltaFunctionCall {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn response_accepts_a_usage_object_that_omits_token_fields() {
+        // Some providers send only `total_tokens`. This must not fail the whole
+        // response — it used to become a 500 on the non-streaming path.
+        let json = r#"{
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"}}],
+            "usage": {"total_tokens": 42}
+        }"#;
+        let parsed: OpenAIResponse = serde_json::from_str(json).expect("usage must deserialize");
+        assert_eq!(parsed.usage.total_tokens, 42);
+        assert_eq!(parsed.usage.prompt_tokens, 0);
+        assert_eq!(parsed.usage.completion_tokens, 0);
+    }
+
+    #[test]
+    fn response_accepts_an_explicit_null_usage() {
+        let json = r#"{
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"}}],
+            "usage": null
+        }"#;
+        let parsed: OpenAIResponse =
+            serde_json::from_str(json).expect("explicit null usage must deserialize");
+        assert_eq!(parsed.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn response_accepts_a_missing_usage_key() {
+        let json = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}"#;
+        let parsed: OpenAIResponse = serde_json::from_str(json).expect("missing usage is fine");
+        assert_eq!(parsed.usage.prompt_tokens, 0);
+    }
+
+    #[test]
+    fn stream_chunk_usage_survives_a_partial_object() {
+        // The streaming path parses StreamChunk; a usage frame missing
+        // `prompt_tokens` used to be dropped silently, recording zero tokens.
+        let json = r#"{"choices":[],"usage":{"completion_tokens":5}}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).expect("partial usage must parse");
+        let usage = chunk.usage.expect("usage present");
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.prompt_tokens, 0);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "anthropic-proxy"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
@@ -70,3 +70,6 @@ lto = true             # Enable Link Time Optimization
 codegen-units = 1      # Better optimization
 strip = true           # Strip symbols for smaller binary
 panic = "abort"        # Smaller binary
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

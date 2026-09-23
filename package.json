@@ -1,6 +1,6 @@
 {
   "name": "proxy-rs",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "private": true,
   "description": "Anthropic API 到 OpenAI 兼容端点的代理（Tauri 2 桌面应用 + Rust 代理核心）",
   "license": "MIT",

@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "anthropic-proxy"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -73,13 +73,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]
 
 [[package]]
 name = "anthropic-proxy-gui"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "anthropic-proxy",
  "anyhow",

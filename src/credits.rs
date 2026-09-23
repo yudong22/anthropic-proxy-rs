@@ -634,11 +634,11 @@ pub async fn credits_handler(
     Extension(service): Extension<Arc<crate::service::ServiceController>>,
     headers: HeaderMap,
 ) -> ProxyResult<Response> {
-    let incoming: String = headers
-        .iter()
-        .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<non-utf8>")))
-        .collect::<Vec<_>>()
-        .join(" | ");
+    // Route through the shared redactor: this line is mirrored to
+    // `~/.proxy-rs/logs/proxy.log`, and callers reach `/v1/credits` with their
+    // own `authorization` / `x-api-key` header attached. Hand-rolling the
+    // header loop here wrote those values out in the clear.
+    let incoming = crate::util::format_headers(&headers);
 
     gui_logs
         .push("INFO", format!("GET /v1/credits headers: {}", incoming))

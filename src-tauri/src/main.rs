@@ -29,6 +29,9 @@ struct AppContext {
     server_shutdown: std::sync::Mutex<CancellationToken>,
     /// Monotonic id of the active server task; bumped on every (re)start.
     server_epoch: Arc<AtomicU16>,
+    /// Whether launchd started this copy. Controls whether it may re-register
+    /// its own job (it must not: `bootout` would kill the caller).
+    is_launchd_child: bool,
 }
 
 struct TrayState {
@@ -91,7 +94,15 @@ async fn get_status(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
         "configured_port": settings.port,
         "bind": settings.bind,
         "api_key_set": !settings.api_key.is_empty(),
-        "launch_at_login": launch_agent::is_installed(),
+        // Whether launchd actually has the job, not merely whether a plist file
+        // is lying around. The two disagree after a user-initiated quit, which
+        // deliberately leaves the plist on disk.
+        "launch_at_login": launch_agent::is_loaded(),
+        "configured_launch_at_login": settings.launch_at_login,
+        "launch_at_login_path": launch_agent::plist_path().display().to_string(),
+        "launch_at_login_plist_present": launch_agent::plist_exists(),
+        "launch_at_login_stale": settings.launch_at_login
+            && !launch_agent::is_loaded(),
         "data_dir": settings::data_dir().map(|d| d.display().to_string()),
         "env_path": settings::dotenv_path().map(|p| p.display().to_string()),
         "log_path": settings::log_file_path().map(|p| p.display().to_string()),
@@ -148,13 +159,44 @@ fn request_stop(app: tauri::AppHandle, ctx: Arc<AppContext>) {
     });
 }
 
+/// Wait briefly for the startup attempt to settle, so the caller can be told
+/// whether the port was actually bound.
+///
+/// `start_proxy_server` is fire-and-forget: binding happens on a spawned task.
+/// Reporting `ok: true` before that task has run is how a busy port used to be
+/// presented to the UI as a success while the log said otherwise. Polling the
+/// controller for a bounded window is enough, because the bind either succeeds
+/// or fails within milliseconds on loopback.
+async fn await_start_outcome(ctx: &Arc<AppContext>) -> (bool, u16) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < deadline {
+        if ctx.service_ctrl.is_running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let running = ctx.service_ctrl.is_running();
+    let port = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
+    (running, port)
+}
+
 #[tauri::command]
 async fn start_service(
     app: tauri::AppHandle,
     ctx: State<'_, Arc<AppContext>>,
 ) -> Result<Value, String> {
     request_start(app, ctx.inner().clone());
-    Ok(json!({ "ok": true }))
+    let (running, port) = await_start_outcome(ctx.inner()).await;
+    if !running {
+        // The server task has already logged the concrete reason (port busy,
+        // invalid config) and the tray reflects "stopped". Tell the caller the
+        // truth instead of a blanket success.
+        return Err(format!(
+            "代理服务启动失败（端口 {} 可能已被占用，请查看日志）",
+            ctx.settings.read().await.port
+        ));
+    }
+    Ok(json!({ "ok": true, "running": true, "port": port }))
 }
 
 #[tauri::command]
@@ -291,9 +333,17 @@ async fn save_settings(
         .push("INFO", format!("设置已保存 (服务商: {})", provider))
         .await;
 
-    // Toggle launch at login
+    // Toggle launch at login.
+    //
+    // The launchd copy skips `install()`: this process *is* the job, and
+    // `install()` re-registers by booting the job out first — which kills the
+    // caller. Toggling the switch on from within the launchd copy is therefore
+    // a no-op in practice; the setting is persisted either way and the next
+    // user-driven start re-arms it. `uninstall()` is safe from any copy.
     if body.launch_at_login {
-        let _ = launch_agent::install();
+        if !ctx.is_launchd_child {
+            let _ = launch_agent::install();
+        }
     } else {
         let _ = launch_agent::uninstall();
     }
@@ -558,11 +608,13 @@ fn focus_main_window(app: &tauri::AppHandle) {
 
 /// Quit for real, surviving launch-at-login.
 ///
-/// The LaunchAgent plist sets `KeepAlive`, so launchd restarts the process the
-/// moment it exits. Calling `app.exit(0)` on its own therefore looks like a
-/// crash and the app reappears immediately — from the user's side, "退出" does
-/// nothing. Booting the job out first removes the reason to relaunch, and the
-/// plist stays on disk so the next login still auto-starts the app.
+/// The LaunchAgent plist restarts the job when the process exits *unsuccessfully*
+/// (`KeepAlive`/`SuccessfulExit=false`), so a plain `app.exit(0)` is enough to
+/// stop the current run. Booting the job out as well is what makes "退出" mean
+/// "do not come back": it removes launchd's record of the job, which would
+/// otherwise relaunch it at the next login. The plist stays on disk so
+/// launch-at-login is re-armed the next time the user starts the app with the
+/// setting still enabled.
 fn quit_app(app: &tauri::AppHandle) {
     if let Err(e) = launch_agent::suspend() {
         eprintln!("Warning: could not suspend launch-at-login before quitting: {e}");
@@ -749,18 +801,13 @@ fn main() {
     // who needs a second concurrent instance changes the configured port.
     let service_ctrl = service::ServiceController::new(false);
 
-    // Re-arm launch-at-login. A user-initiated quit boots the job out (so the
-    // exit is not undone by `KeepAlive`) while leaving the plist on disk, which
-    // means the login item is only registered again from here. Without this the
-    // setting would still read as enabled but never actually fire.
-    if settings.launch_at_login {
-        let _ = launch_agent::install();
-    }
-
-    // Install the global metrics recorder once, up front. Doing it here (rather
-    // than inside the server task) makes any failure visible at startup instead
-    // of silently aborting the first proxy (re)start.
-    let _ = metrics::install();
+    // Whether launchd started this copy. Resolved *before* anything touches the
+    // job, because the launchd copy must never re-register its own job: that
+    // means `bootout`, and this process *is* the job.
+    let is_launchd_child = launch_agent::running_as_launchd_child(std::env::args());
+    // Deferred until the single-instance guard has accepted this process; see
+    // the `.setup()` closure. Captured here because `settings` moves into `ctx`.
+    let wants_launch_at_login = settings.launch_at_login;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -786,46 +833,61 @@ fn main() {
         }),
         server_shutdown: std::sync::Mutex::new(CancellationToken::new()),
         server_epoch: Arc::new(AtomicU16::new(0)),
+        is_launchd_child,
     });
 
     let ctx_for_setup = ctx.clone();
     let ctx_for_tray = ctx.clone();
 
-    // A launchd-managed instance must not be treated as a duplicate launch.
-    // The single-instance plugin kills the newer process on a second launch, and
-    // because the plist sets `KeepAlive`, launchd would immediately start it
-    // again — an endless start/kill loop whenever the login item and a manually
-    // opened copy overlap. The flag is what tells the two apart.
-    let is_launchd_child = launch_agent::running_as_launchd_child(std::env::args());
-
     let mut builder = tauri::Builder::default();
 
-    if !is_launchd_child {
-        // Registered first, as the plugin requires: on a second launch this
-        // process is killed immediately and the callback runs in the original
-        // instance, which reveals its window. That keeps the proxy bound to the
-        // one port the client CLIs are configured against instead of leaving a
-        // second, portless copy in the Dock.
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            focus_main_window(app);
-            let ctx = app.state::<Arc<AppContext>>().inner().clone();
-            // A second launch means "I could not find the window": if the
-            // service was stopped, start it too, so the app always ends up in a
-            // usable state.
-            if !ctx.service_ctrl.is_running() {
-                request_start(app.clone(), ctx.clone());
-            }
-            tauri::async_runtime::spawn(async move {
-                ctx.logs
-                    .push("INFO", "重复启动已合并到当前实例".to_string())
-                    .await;
-            });
-        }));
-    }
+    // Registered for every copy, including the launchd child. The guard is what
+    // keeps the proxy bound to the one fixed port the client CLIs are pointed
+    // at, so exempting the launchd copy would leave the two copies unguarded
+    // against each other. It is safe to apply to both: the plist's `KeepAlive`
+    // only restarts the job after a *failed* exit, so a clean `exit(0)` from a
+    // duplicate performs a single hand-off to the original instead of looping.
+    builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        focus_main_window(app);
+        let ctx = app.state::<Arc<AppContext>>().inner().clone();
+        // A second launch means "I could not find the window": if the
+        // service was stopped, start it too, so the app always ends up in a
+        // usable state.
+        if !ctx.service_ctrl.is_running() {
+            request_start(app.clone(), ctx.clone());
+        }
+        tauri::async_runtime::spawn(async move {
+            ctx.logs
+                .push(
+                    "INFO",
+                    format!("重复启动已合并到当前实例 (pid {})", std::process::id()),
+                )
+                .await;
+        });
+    }));
 
     builder
         .manage(ctx)
         .setup(move |app| {
+            // Re-arm launch-at-login only once the single-instance guard has
+            // accepted this process. Tauri initializes plugins during `build()`,
+            // before this closure runs, so a duplicate has already exited by
+            // now. Arming earlier would let the bootstrapped `RunAtLoad` copy
+            // race this process for the singleton socket and win, leaving the
+            // window the user just opened to exit instead.
+            if launch_agent::should_rearm_at_startup(
+                wants_launch_at_login,
+                is_launchd_child,
+                launch_agent::is_loaded(),
+            ) {
+                let _ = launch_agent::install();
+            } else if wants_launch_at_login && is_launchd_child {
+                // Must not touch the live job, but a plist written by an older
+                // build can still carry the dangerous unconditional `KeepAlive`.
+                // Refresh the file only; launchd reads it at the next load.
+                let _ = launch_agent::rewrite_plist_if_stale();
+            }
+
             let app_handle = app.handle().clone();
             start_proxy_server(app_handle.clone(), ctx_for_setup);
 
