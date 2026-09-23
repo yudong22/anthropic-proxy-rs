@@ -73,26 +73,39 @@ code, pre, .mono {
 }
 
 .header {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  /* .header-left is absolutely positioned (see below), so .header-right is the
+     only in-flow child and is pushed to the right edge. */
+  justify-content: flex-end;
   /* Left inset clears the macOS traffic-light cluster (close/min/max) that the
-     Overlay title-bar style floats over this header. The bar stays a drag
-     region across its full width, so only the content shifts right. */
+     Overlay title-bar style floats over this header. */
   padding: 10px 16px 10px 76px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  -webkit-app-region: drag; /* Allows dragging native window by header */
+  /* Chromium-only (Windows WebView2). On macOS WKWebView this property is
+     ignored — dragging there comes from `data-tauri-drag-region` on the
+     header element. */
+  -webkit-app-region: drag;
 }
 
 .header button, .header input, .header select, .tabs button {
   -webkit-app-region: no-drag;
 }
 
+/* The title/brand is centred in the bar, independent of the left and right
+   clusters: absolutely positioned so the asymmetric traffic-light padding
+   cannot shift it off-centre. Tauri's drag script tests `e.target` directly
+   (not `closest()`), and this box spans the bar, so `pointer-events: none`
+   lets clicks fall through to the header's drag region. */
 .header-left {
+  position: absolute;
+  inset: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  pointer-events: none;
 }
 
 .logo {
@@ -471,10 +484,12 @@ code, pre, .mono {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .03em;
-  padding: 8px 12px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   z-index: 2;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .data-table tbody tr {
@@ -494,9 +509,13 @@ code, pre, .mono {
   background: rgba(220, 53, 69, 0.08);
 }
 
+/* `overflow: hidden` is the backstop: with a fixed table layout a cell cannot
+   widen, so any content wider than its column must be clipped here rather than
+   painted over the neighbouring cell. */
 .data-table td {
-  padding: 8px 12px;
+  padding: 8px 10px;
   vertical-align: middle;
+  overflow: hidden;
 }
 
 .cell-time {
@@ -510,10 +529,10 @@ code, pre, .mono {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  /* The model id and the route below it are the widest useful cell; let the
-     table give this column the slack the narrow time/session columns free up. */
+  /* Fills its column and is allowed to shrink; the column width (the flexible
+     remainder of the header) decides how much room the model id gets. */
   min-width: 0;
-  max-width: 420px;
+  max-width: 100%;
 }
 
 .cell-model {
@@ -530,21 +549,22 @@ code, pre, .mono {
   font-size: 10px;
   color: var(--muted);
   font-family: var(--mono);
-  /* `/model` and friends must not be clipped: no ellipsis here, the column
-     width is what keeps it readable. */
+  /* Must clip like the model id above it: a nowrap line with visible overflow
+     would paint straight across the next column. */
   white-space: nowrap;
-  overflow: visible;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* The session column must keep a hard floor so the client pill (e.g. "claude")
-   and the short session id never get squeezed into an ellipsis on narrow
-   windows. The model column already carries the slack (max-width + ellipsis),
-   so it absorbs the squeeze instead of this one. */
+/* The client pill keeps its natural size and the id ellipsizes beside it. There
+   is deliberately no min-width floor here — the box must fit inside its own
+   column instead of spilling over the model column. */
 .cell-session-box {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 170px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .cell-session {
@@ -604,6 +624,9 @@ code, pre, .mono {
   font-size: 10px;
   color: var(--muted);
   display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .cell-duration {
@@ -1096,9 +1119,12 @@ input:checked + .toggle-slider::before {
   font-size: 11px;
 }
 
+/* Three-dot quick-actions menu button (opens the ⌘K palette). */
 .btn-palette {
-  font-family: var(--mono);
   color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 3px 9px;
 }
 
 .btn-show-hide {
