@@ -15,12 +15,15 @@ jobs:
     strategy:
       matrix:
         include:
+          # Apple Silicon only. The Intel leg (`macos-13`,
+          # x86_64-apple-darwin) was removed: GitHub's `macos-13` pool is
+          # deprecated and starved, so the job sat queued with no runner ever
+          # assigned. Because `release` and `publish` both need this matrix to
+          # finish, one unrunnable leg held the whole release hostage —
+          # v1.3.0's GitHub Release and crates.io publish were blocked by it.
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: macos-aarch64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact_name: macos-x86_64
 
     runs-on: ${{ matrix.os }}
 
