@@ -211,25 +211,29 @@ pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::Mod
     }
 }
 
-fn select_model(req: &anthropic::AnthropicRequest, policy: &TranslationPolicy) -> String {
-    let has_thinking = req
-        .extra
-        .get("thinking")
-        .and_then(|v| v.as_object())
-        .map(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"))
-        .unwrap_or(false);
-
-    let model = if has_thinking {
-        policy
-            .reasoning_model
-            .clone()
-            .unwrap_or_else(|| req.model.clone())
-    } else {
-        policy
-            .completion_model
-            .clone()
-            .unwrap_or_else(|| req.model.clone())
-    };
+/// Resolve the upstream model for a client-facing model name.
+///
+/// The one place the precedence lives, shared by every route so a request
+/// cannot reach a different upstream model depending on which endpoint it
+/// arrived at:
+///
+/// 1. the policy's configured model for this kind of request (if any),
+/// 2. otherwise the model the client asked for,
+/// 3. then `model_map`, applied to whichever of those won,
+/// 4. then the `[1M]`-style suffix stripped, when configured.
+///
+/// The configured model deliberately outranks the client's: it exists precisely
+/// to override what the client sends. Note `model_map` is consulted *after*
+/// that override, so a mapping keyed on the client's model name does not apply
+/// once a configured model has taken its place.
+pub(crate) fn resolve_upstream_model(
+    client_model: &str,
+    configured_model: Option<&String>,
+    policy: &TranslationPolicy,
+) -> String {
+    let model = configured_model
+        .cloned()
+        .unwrap_or_else(|| client_model.to_string());
 
     let resolved = policy
         .model_map
@@ -242,6 +246,23 @@ fn select_model(req: &anthropic::AnthropicRequest, policy: &TranslationPolicy) -
     } else {
         resolved
     }
+}
+
+fn select_model(req: &anthropic::AnthropicRequest, policy: &TranslationPolicy) -> String {
+    let has_thinking = req
+        .extra
+        .get("thinking")
+        .and_then(|v| v.as_object())
+        .map(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"))
+        .unwrap_or(false);
+
+    let configured = if has_thinking {
+        policy.reasoning_model.as_ref()
+    } else {
+        policy.completion_model.as_ref()
+    };
+
+    resolve_upstream_model(&req.model, configured, policy)
 }
 
 pub(crate) fn sanitize_prompt(text: String, terms: &[String]) -> String {
@@ -465,6 +486,131 @@ mod tests {
 
     fn default_policy() -> TranslationPolicy {
         policy_from(&Config::default())
+    }
+
+    // ---- model resolution ---------------------------------------------------
+
+    fn policy_with(
+        completion: Option<&str>,
+        reasoning: Option<&str>,
+        map: &[(&str, &str)],
+        strip_suffix: bool,
+    ) -> TranslationPolicy {
+        TranslationPolicy {
+            reasoning_model: reasoning.map(str::to_string),
+            completion_model: completion.map(str::to_string),
+            model_map: map
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ignore_terms: Vec::new(),
+            strip_model_suffix: strip_suffix,
+            sanitize_fingerprints: false,
+        }
+    }
+
+    #[test]
+    fn configured_model_outranks_the_client_model() {
+        // The configured model exists to override what the client sends.
+        let p = policy_with(Some("gpt-5"), None, &[], false);
+        assert_eq!(
+            resolve_upstream_model("sonnet", p.completion_model.as_ref(), &p),
+            "gpt-5"
+        );
+    }
+
+    #[test]
+    fn the_client_model_is_used_when_nothing_is_configured() {
+        let p = policy_with(None, None, &[], false);
+        assert_eq!(resolve_upstream_model("sonnet", None, &p), "sonnet");
+    }
+
+    #[test]
+    fn model_map_applies_to_the_client_model_when_none_is_configured() {
+        let p = policy_with(None, None, &[("sonnet", "glm-5.3")], false);
+        assert_eq!(resolve_upstream_model("sonnet", None, &p), "glm-5.3");
+    }
+
+    #[test]
+    fn the_configured_model_is_itself_mapped() {
+        // `model_map` is consulted after the override, so a mapping keyed on
+        // the configured model still applies.
+        let p = policy_with(Some("gpt-5"), None, &[("gpt-5", "glm-5.3")], false);
+        assert_eq!(
+            resolve_upstream_model("sonnet", p.completion_model.as_ref(), &p),
+            "glm-5.3"
+        );
+    }
+
+    #[test]
+    fn a_mapping_keyed_on_the_client_model_does_not_survive_an_override() {
+        // Documents the consequence of that order: once a configured model
+        // replaces the client's, a mapping named after the client's model is
+        // no longer consulted. Pinned because it is easy to read as a bug.
+        let p = policy_with(Some("gpt-5"), None, &[("sonnet", "glm-5.3")], false);
+        assert_eq!(
+            resolve_upstream_model("sonnet", p.completion_model.as_ref(), &p),
+            "gpt-5"
+        );
+    }
+
+    #[test]
+    fn the_suffix_is_stripped_only_when_configured() {
+        let off = policy_with(None, None, &[], false);
+        assert_eq!(resolve_upstream_model("m[1M]", None, &off), "m[1M]");
+
+        let on = policy_with(None, None, &[], true);
+        assert_eq!(resolve_upstream_model("m[1M]", None, &on), "m");
+    }
+
+    fn req_with_model(model: &str, extra: Value) -> anthropic::AnthropicRequest {
+        anthropic::AnthropicRequest {
+            model: model.to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("pong".to_string()),
+            }],
+            max_tokens: 64,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: Some(false),
+            tools: None,
+            metadata: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn a_thinking_request_resolves_against_the_reasoning_model() {
+        // `select_model` picks which configured model applies before delegating.
+        let p = policy_with(Some("completion"), Some("reasoning"), &[], false);
+        let thinking = req_with_model("sonnet", json!({ "thinking": { "type": "enabled" } }));
+        assert_eq!(select_model(&thinking, &p), "reasoning");
+
+        let plain = req_with_model("sonnet", json!({ "thinking": { "type": "disabled" } }));
+        assert_eq!(select_model(&plain, &p), "completion");
+    }
+
+    #[test]
+    fn every_route_resolves_the_same_client_model_identically() {
+        // The regression this guards: the Chat and Responses paths used to map
+        // *first* and fall back to `completion_model` second, so the same
+        // request reached a different upstream model per endpoint.
+        let p = policy_with(Some("gpt-5"), None, &[("sonnet", "glm-5.3")], false);
+
+        // What the Anthropic route produces (via select_model).
+        let anthropic_route = select_model(&req_with_model("sonnet", json!({})), &p);
+
+        // What the Chat and Responses routes produce (same shared function).
+        let other_routes = resolve_upstream_model("sonnet", p.completion_model.as_ref(), &p);
+
+        assert_eq!(
+            anthropic_route, other_routes,
+            "one client model must not resolve differently per route"
+        );
     }
 
     // ---- fingerprint sanitization ------------------------------------------

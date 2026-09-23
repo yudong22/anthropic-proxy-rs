@@ -1,7 +1,7 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{openai, responses};
 use crate::translate::core::normalize_schema;
-use crate::translate::pipeline::{sanitize_prompt, strip_model_suffix, TranslationPolicy};
+use crate::translate::pipeline::{resolve_upstream_model, sanitize_prompt, TranslationPolicy};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,16 +29,11 @@ pub fn translate_responses_request(
     req: responses::ResponsesRequest,
     policy: &TranslationPolicy,
 ) -> ProxyResult<openai::OpenAIRequest> {
-    let mut model = policy
-        .model_map
-        .get(&req.model)
-        .cloned()
-        .or_else(|| policy.completion_model.clone())
-        .unwrap_or_else(|| req.model.clone());
-
-    if policy.strip_model_suffix {
-        model = strip_model_suffix(&model);
-    }
+    // Shared precedence with the Anthropic route, so the same client model
+    // cannot resolve differently depending on the endpoint it arrived at.
+    // Responses has no `thinking` flag, so it resolves against
+    // `completion_model` like the Chat path.
+    let model = resolve_upstream_model(&req.model, policy.completion_model.as_ref(), policy);
 
     let mut messages = Vec::new();
 
@@ -954,6 +949,51 @@ mod tests {
             strip_model_suffix: false,
             sanitize_fingerprints: true,
         }
+    }
+
+    fn req_for_model(model: &str) -> responses::ResponsesRequest {
+        responses::ResponsesRequest {
+            model: model.to_string(),
+            input: responses::ResponsesInput::Text("hi".to_string()),
+            instructions: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            max_tokens: None,
+            stream: Some(false),
+            parallel_tool_calls: None,
+            reasoning: None,
+            store: None,
+            include: None,
+            prompt_cache_key: None,
+        }
+    }
+
+    #[test]
+    fn a_configured_model_outranks_the_client_model() {
+        // Regression: this path used to look up `model_map` against the *client*
+        // model first and only fall back to `completion_model`, so a configured
+        // model lost to a stale mapping and the same request reached a
+        // different upstream model here than on `/v1/messages`.
+        let policy = TranslationPolicy {
+            completion_model: Some("gpt-5".to_string()),
+            model_map: [("gpt-4o".to_string(), "glm-5.3".to_string())]
+                .into_iter()
+                .collect(),
+            ..test_policy()
+        };
+
+        let openai_req = translate_responses_request(req_for_model("gpt-4o"), &policy).unwrap();
+        assert_eq!(openai_req.model, "gpt-5");
+    }
+
+    #[test]
+    fn the_client_model_survives_when_nothing_overrides_it() {
+        let openai_req =
+            translate_responses_request(req_for_model("gpt-4o"), &test_policy()).unwrap();
+        assert_eq!(openai_req.model, "gpt-4o");
     }
 
     #[test]

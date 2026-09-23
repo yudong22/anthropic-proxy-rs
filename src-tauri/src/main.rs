@@ -269,12 +269,10 @@ async fn save_settings(
 
     s.save().map_err(|e| format!("保存配置失败: {}", e))?;
 
-    let new_port = s.port;
     let provider = s.provider_id.clone();
     let upstream = s.chat_url(&providers::builtin_presets());
     drop(s);
 
-    ctx.service_ctrl.set_preferred_port(new_port);
     ctx.logs
         .push("INFO", format!("设置已保存 (服务商: {})", provider))
         .await;
@@ -676,7 +674,7 @@ fn run_proxy_server(
 
         ctx.bound_port
             .store(bound_port, std::sync::atomic::Ordering::SeqCst);
-        ctx.service_ctrl.mark_running(bound_port);
+        ctx.service_ctrl.mark_running();
         update_tray_state(&app, &ctx);
         ctx.logs
             .push(
@@ -730,7 +728,12 @@ fn stop_proxy_server(ctx: Arc<AppContext>) {
 
 fn main() {
     let settings = GuiSettings::load();
-    let service_ctrl = service::ServiceController::new(settings.port, true);
+    // No port fallback. Every client CLI is configured against one fixed
+    // gateway URL, so silently binding a different port breaks them with no
+    // visible cause — the busy port is surfaced as an error instead, and the
+    // single-instance guard is what actually keeps the port free. A developer
+    // who needs a second concurrent instance changes the configured port.
+    let service_ctrl = service::ServiceController::new(false);
 
     // Re-arm launch-at-login. A user-initiated quit boots the job out (so the
     // exit is not undone by `KeepAlive`) while leaving the plist on disk, which

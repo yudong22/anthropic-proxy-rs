@@ -100,7 +100,8 @@ pub async fn proxy_handler(
 
     tracing::debug!("Received request for model: {}", req.model);
     tracing::debug!("Streaming: {}", is_streaming);
-    metrics::request_started(is_streaming);
+    // Held for the whole handler: any early return still balances the gauge.
+    let in_flight = metrics::InFlightGuard::start(is_streaming);
 
     if config.verbose {
         tracing::trace!(
@@ -114,7 +115,28 @@ pub async fn proxy_handler(
     let client_model = req.model.clone();
     let message_count = req.messages.len();
     let tool_count = req.tools.as_ref().map(|t| t.len()).unwrap_or(0);
-    let openai_req = pipeline::translate_request(req, &policy)?;
+    // A translation failure is a real 400 the client does not see otherwise:
+    // record it like any other outcome rather than letting `?` skip the log row.
+    let openai_req = match pipeline::translate_request(req, &policy) {
+        Ok(req) => req,
+        Err(err) => {
+            finalize_request(
+                400,
+                Some(err.to_string()),
+                &gui_logs,
+                &stats,
+                "/v1/messages",
+                &client_model,
+                is_streaming,
+                start,
+                &session,
+                &tag,
+                in_flight,
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     if config.verbose {
         tracing::trace!(
@@ -161,6 +183,7 @@ pub async fn proxy_handler(
         start,
         &session,
         &tag,
+        in_flight,
     )
     .await;
 
@@ -203,7 +226,8 @@ pub async fn responses_proxy_handler(
 
     tracing::debug!("Received Responses API request for model: {}", req.model);
     tracing::debug!("Streaming: {}", is_streaming);
-    metrics::request_started(is_streaming);
+    // Held for the whole handler: any early return still balances the gauge.
+    let in_flight = metrics::InFlightGuard::start(is_streaming);
 
     if config.verbose {
         tracing::trace!(
@@ -214,7 +238,28 @@ pub async fn responses_proxy_handler(
 
     let policy = translation_policy(&config);
     let client_model = req.model.clone();
-    let openai_req = responses_pipeline::translate_responses_request(req, &policy)?;
+    // A translation failure is a real 400 the client does not see otherwise:
+    // record it like any other outcome rather than letting `?` skip the log row.
+    let openai_req = match responses_pipeline::translate_responses_request(req, &policy) {
+        Ok(req) => req,
+        Err(err) => {
+            finalize_request(
+                400,
+                Some(err.to_string()),
+                &gui_logs,
+                &stats,
+                "/v1/responses",
+                &client_model,
+                is_streaming,
+                start,
+                &session,
+                &tag,
+                in_flight,
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     if config.verbose {
         tracing::trace!(
@@ -261,6 +306,7 @@ pub async fn responses_proxy_handler(
         start,
         &session,
         &tag,
+        in_flight,
     )
     .await;
 
@@ -310,7 +356,8 @@ pub async fn chat_completions_proxy_handler(
 
     tracing::debug!("Received Chat Completions request for model: {}", req.model);
     tracing::debug!("Streaming: {}", is_streaming);
-    metrics::request_started(is_streaming);
+    // Held for the whole handler: any early return still balances the gauge.
+    let in_flight = metrics::InFlightGuard::start(is_streaming);
 
     if config.verbose {
         tracing::trace!(
@@ -322,19 +369,12 @@ pub async fn chat_completions_proxy_handler(
     let policy = translation_policy(&config);
     let client_model = req.model.clone();
 
-    // 1. Model remapping and optional stripping of suffix (e.g. [1M])
-    let mapped_model = policy
-        .model_map
-        .get(&req.model)
-        .cloned()
-        .or_else(|| policy.completion_model.clone())
-        .unwrap_or_else(|| req.model.clone());
-
-    req.model = if policy.strip_model_suffix {
-        pipeline::strip_model_suffix(&mapped_model)
-    } else {
-        mapped_model
-    };
+    // Same resolution as the other two routes, so a request cannot reach a
+    // different upstream model depending on which endpoint it arrives at. This
+    // path has no `thinking` flag — OpenAI-format clients select reasoning via
+    // the model name itself — so it resolves against `completion_model`.
+    req.model =
+        pipeline::resolve_upstream_model(&req.model, policy.completion_model.as_ref(), &policy);
 
     // 2. Sanitize system prompt if ignore terms are configured
     if !policy.ignore_terms.is_empty() {
@@ -389,6 +429,7 @@ pub async fn chat_completions_proxy_handler(
         start,
         &session,
         &tag,
+        in_flight,
     )
     .await;
 
@@ -444,8 +485,9 @@ async fn finalize_request(
     start: Instant,
     session: &SessionInfo,
     tag: &str,
+    in_flight: metrics::InFlightGuard,
 ) {
-    metrics::request_finished(start, status, is_streaming);
+    in_flight.finish(start, status);
 
     match error {
         None => {
@@ -2670,8 +2712,8 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
-        let service = crate::service::ServiceController::new(8080, false);
-        service.mark_running(8080);
+        let service = crate::service::ServiceController::new(false);
+        service.mark_running();
         // The real Codex header set, reduced to the fields the session
         // resolver reads, so this test also proves the end-to-end attribution.
         let mut headers = HeaderMap::new();
@@ -2803,8 +2845,8 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
-        let service = crate::service::ServiceController::new(8080, false);
-        service.mark_running(8080);
+        let service = crate::service::ServiceController::new(false);
+        service.mark_running();
         let headers = HeaderMap::new();
         let req = responses::ResponsesRequest {
             model: "gpt-4o".to_string(),
@@ -3026,8 +3068,8 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
-        let service = crate::service::ServiceController::new(8080, false);
-        service.mark_running(8080);
+        let service = crate::service::ServiceController::new(false);
+        service.mark_running();
         let stats_db = mock_stats();
 
         let mut extra = serde_json::Map::new();
@@ -3164,8 +3206,8 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
-        let service = crate::service::ServiceController::new(8080, false);
-        service.mark_running(8080);
+        let service = crate::service::ServiceController::new(false);
+        service.mark_running();
         let stats_db = mock_stats();
 
         let req = openai::OpenAIRequest {
@@ -3307,8 +3349,8 @@ mod tests {
             force_stream_upstream: true,
             ..Default::default()
         });
-        let service = crate::service::ServiceController::new(8080, false);
-        service.mark_running(8080);
+        let service = crate::service::ServiceController::new(false);
+        service.mark_running();
 
         let req = openai::OpenAIRequest {
             model: "glm".to_string(),

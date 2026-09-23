@@ -107,7 +107,12 @@ fn chrono_now() -> String {
     crate::util::local_datetime_millis()
 }
 
-/// Default listen port; if taken at startup, the proxy falls back to +1.
+/// Default listen port.
+///
+/// A busy port is a hard error rather than a silent `+1`: the client CLIs are
+/// configured against this one fixed URL (see `ServiceController`), so a dev
+/// instance that needs to run alongside the installed app sets its own port
+/// instead of being moved off this one.
 pub const DEFAULT_PORT: u16 = 3456;
 
 /// Persisted proxy and GUI settings in `~/.proxy-rs/gui-settings.json`.

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -14,8 +14,6 @@ use axum::{
 /// UI reads.
 pub struct ServiceController {
     running: AtomicBool,
-    port: AtomicU16,
-    preferred_port: AtomicU16,
     /// Whether to retry `preferred + 1` when the preferred port is taken.
     ///
     /// Off in the desktop app: the client CLIs are configured against one fixed
@@ -27,11 +25,9 @@ pub struct ServiceController {
 }
 
 impl ServiceController {
-    pub fn new(preferred_port: u16, allow_port_fallback: bool) -> Arc<Self> {
+    pub fn new(allow_port_fallback: bool) -> Arc<Self> {
         Arc::new(Self {
             running: AtomicBool::new(false),
-            port: AtomicU16::new(0),
-            preferred_port: AtomicU16::new(preferred_port),
             allow_port_fallback: AtomicBool::new(allow_port_fallback),
         })
     }
@@ -40,35 +36,17 @@ impl ServiceController {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Port the service listens on, or 0 while stopped.
-    pub fn port(&self) -> u16 {
-        self.port.load(Ordering::SeqCst)
-    }
-
-    pub fn set_preferred_port(&self, port: u16) {
-        self.preferred_port.store(port, Ordering::SeqCst);
-    }
-
     pub fn allow_port_fallback(&self) -> bool {
         self.allow_port_fallback.load(Ordering::SeqCst)
     }
 
-    /// Retry `preferred + 1` when the preferred port is busy. The desktop app
-    /// leaves this off so the configured port is the only one ever used.
-    pub fn set_allow_port_fallback(&self, allow: bool) {
-        self.allow_port_fallback.store(allow, Ordering::SeqCst);
-    }
-
-    pub fn mark_running(&self, port: u16) {
-        self.port.store(port, Ordering::SeqCst);
+    pub fn mark_running(&self) {
         self.running.store(true, Ordering::SeqCst);
     }
 
-    /// Mark the service as stopped: clears the bound port and the running flag
-    /// so the GUI reflects reality.
+    /// Mark the service as stopped so the GUI reflects reality.
     pub fn mark_stopped(&self) {
         self.running.store(false, Ordering::SeqCst);
-        self.port.store(0, Ordering::SeqCst);
     }
 
     /// Bind the preferred port, falling back to `preferred + 1` when allowed.
@@ -112,4 +90,54 @@ pub fn service_unavailable_response() -> Response {
         )
         .expect("static response builds")
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_desktop_app_does_not_fall_back_to_another_port() {
+        // A busy port must be a hard error, not a silent retarget: every client
+        // CLI is pointed at one fixed gateway URL, so binding `port + 1` breaks
+        // them with no visible cause. A developer who needs a second concurrent
+        // instance changes the configured port instead.
+        let ctrl = ServiceController::new(false);
+        assert!(!ctrl.allow_port_fallback());
+    }
+
+    #[tokio::test]
+    async fn bind_reports_a_busy_port_instead_of_moving_when_fallback_is_off() {
+        // Occupy a port, then ask for it with fallback disabled.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = held.local_addr().unwrap().port();
+
+        let err = ServiceController::bind("127.0.0.1", port, false)
+            .await
+            .expect_err("a busy port must be an error when fallback is off");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn bind_falls_back_only_when_explicitly_asked() {
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = held.local_addr().unwrap().port();
+
+        let (_listener, bound) = ServiceController::bind("127.0.0.1", port, true)
+            .await
+            .expect("fallback should find the next port");
+        assert_eq!(bound, port + 1);
+    }
+
+    #[test]
+    fn the_running_flag_tracks_state() {
+        let ctrl = ServiceController::new(false);
+        assert!(!ctrl.is_running());
+
+        ctrl.mark_running();
+        assert!(ctrl.is_running());
+
+        ctrl.mark_stopped();
+        assert!(!ctrl.is_running());
+    }
 }
