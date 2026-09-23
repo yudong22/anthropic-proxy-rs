@@ -34,6 +34,11 @@ pub struct RequestOutcome<'a> {
     pub status: u16,
     /// Error message when the request failed.
     pub error: Option<&'a str>,
+    /// Namespaced session id resolved by `session::detect`, e.g.
+    /// `codex:01a0cc30-….` Empty when the client could not be identified.
+    pub session_id: &'a str,
+    /// Client dialect tag (`codex` / `claude` / `dsh` / `unknown`).
+    pub client: &'a str,
 }
 
 impl RequestOutcome<'_> {
@@ -52,6 +57,8 @@ impl RequestOutcome<'_> {
             streamed: self.streamed,
             status: self.status,
             error: self.error.map(|e| e.to_string()),
+            session_id: self.session_id.to_string(),
+            client: self.client.to_string(),
         }
     }
 }
@@ -71,6 +78,8 @@ struct RequestRow {
     streamed: bool,
     status: u16,
     error: Option<String>,
+    session_id: String,
+    client: String,
 }
 
 impl RequestRow {
@@ -78,8 +87,8 @@ impl RequestRow {
         "INSERT INTO request_logs (
             date, created_at, model, route,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            duration_ms, streamed, status, error
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            duration_ms, streamed, status, error, session_id, client
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
     }
 
     fn bind_to(&self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
@@ -96,6 +105,8 @@ impl RequestRow {
             if self.streamed { 1 } else { 0 },
             self.status as i64,
             self.error,
+            self.session_id,
+            self.client,
         ])?;
         Ok(())
     }
@@ -116,17 +127,34 @@ pub struct RequestLogItem {
     pub streamed: bool,
     pub status: u16,
     pub error: Option<String>,
+    /// Namespaced session id (`codex:…` / `claude:…` / `dsh:…`), or empty.
+    pub session_id: String,
+    /// Client dialect tag, or `unknown`.
+    pub client: String,
 }
 
 /// Filter criteria for querying request logs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestLogFilter {
     pub model: Option<String>,
+    /// Restrict to one client dialect: `codex` / `claude` / `dsh` / `unknown`.
+    pub client: Option<String>,
+    /// Restrict to one exact session id (`codex:01a0cc30-…`).
+    pub session_id: Option<String>,
     pub status_group: Option<String>,
     pub streamed: Option<bool>,
     pub search: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// One distinct conversation, for the session filter dropdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLogSession {
+    /// Namespaced id as stored (`codex:<uuid>`, `claude:<uuid>`, `dsh:<key>`).
+    pub session_id: String,
+    /// Owning dialect, shown beside the id so two clients' ids stay tellable apart.
+    pub client: String,
 }
 
 /// Query result containing matched items, total count and model list.
@@ -135,6 +163,12 @@ pub struct RequestLogsResult {
     pub items: Vec<RequestLogItem>,
     pub total: i64,
     pub models: Vec<String>,
+    /// Distinct client dialects present in the database, for the filter UI.
+    pub clients: Vec<String>,
+    /// Distinct conversations, newest first. Queried over the whole table rather
+    /// than derived from `items`, so a chat whose latest request is on an older
+    /// page can still be selected.
+    pub sessions: Vec<RequestLogSession>,
 }
 
 /// Aggregated statistics for a single calendar day.
@@ -266,7 +300,9 @@ impl StatsDb {
                 duration_ms         INTEGER NOT NULL DEFAULT 0,
                 streamed            INTEGER NOT NULL DEFAULT 0,
                 status              INTEGER NOT NULL DEFAULT 0,
-                error               TEXT
+                error               TEXT,
+                session_id          TEXT NOT NULL DEFAULT '',
+                client              TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_id_desc ON request_logs(id DESC);
             CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC);
@@ -277,7 +313,9 @@ impl StatsDb {
         // exists after migration on databases from older builds.
         Self::migrate(conn)?;
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_request_logs_date ON request_logs(date);",
+            "CREATE INDEX IF NOT EXISTS idx_request_logs_date ON request_logs(date);
+             CREATE INDEX IF NOT EXISTS idx_request_logs_session_id
+                 ON request_logs(session_id);",
         )?;
         Ok(())
     }
@@ -295,6 +333,25 @@ impl StatsDb {
 
         if !has_date {
             conn.execute("ALTER TABLE request_logs ADD COLUMN date TEXT", [])?;
+        }
+
+        // `session_id`/`client` arrived with session-aware logging. SQLite has
+        // no `ADD COLUMN IF NOT EXISTS`, so each is probed first and old rows
+        // keep the empty-string default.
+        for column in ["session_id", "client"] {
+            let exists = conn
+                .prepare("PRAGMA table_info(request_logs)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .flatten()
+                .any(|col| col == column);
+            if !exists {
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE request_logs ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    ),
+                    [],
+                )?;
+            }
         }
 
         // Backfill rows written before the column existed.
@@ -346,6 +403,38 @@ impl StatsDb {
             }
         }
 
+        // 1b. Data-driven client list, so the dropdown only offers dialects
+        //     that actually appear in this database.
+        let mut client_stmt = conn.prepare(
+            "SELECT DISTINCT client FROM request_logs WHERE client != '' ORDER BY client ASC",
+        )?;
+        let clients_iter = client_stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut clients = Vec::new();
+        for c in clients_iter.flatten() {
+            if !c.is_empty() {
+                clients.push(c);
+            }
+        }
+
+        // 1c. Conversations for the session filter, newest first. Capped so a
+        //     long-lived database cannot make the dropdown itself the slow part;
+        //     the cap is generous enough to cover any realistic recent history.
+        let mut session_stmt = conn.prepare(
+            "SELECT session_id, MAX(client) FROM request_logs
+              WHERE session_id != ''
+              GROUP BY session_id
+              ORDER BY MAX(id) DESC
+              LIMIT 200",
+        )?;
+        let sessions_iter = session_stmt.query_map([], |row| {
+            Ok(RequestLogSession {
+                session_id: row.get::<_, String>(0)?,
+                client: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            })
+        })?;
+        let mut sessions: Vec<RequestLogSession> = sessions_iter.flatten().collect();
+        sessions.retain(|s| !s.session_id.is_empty());
+
         // 2. Build WHERE clause
         let mut where_clauses = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -377,6 +466,19 @@ impl StatsDb {
             }
         }
 
+        for (value, column) in [
+            (&filter.client, "client"),
+            (&filter.session_id, "session_id"),
+        ] {
+            if let Some(ref v) = value {
+                let v = v.trim();
+                if !v.is_empty() && v != "all" {
+                    where_clauses.push(format!("{column} = ?"));
+                    params.push(Box::new(v.to_string()));
+                }
+            }
+        }
+
         if let Some(streamed) = filter.streamed {
             where_clauses.push("streamed = ?".to_string());
             params.push(Box::new(if streamed { 1 } else { 0 }));
@@ -385,11 +487,15 @@ impl StatsDb {
         if let Some(ref q) = filter.search {
             let q_trimmed = q.trim();
             if !q_trimmed.is_empty() {
-                where_clauses.push("(model LIKE ? OR route LIKE ? OR error LIKE ?)".to_string());
+                where_clauses.push(
+                    "(model LIKE ? OR route LIKE ? OR error LIKE ? \
+                     OR session_id LIKE ? OR client LIKE ?)"
+                        .to_string(),
+                );
                 let like_pat = format!("%{}%", q_trimmed);
-                params.push(Box::new(like_pat.clone()));
-                params.push(Box::new(like_pat.clone()));
-                params.push(Box::new(like_pat));
+                for _ in 0..5 {
+                    params.push(Box::new(like_pat.clone()));
+                }
             }
         }
 
@@ -414,7 +520,7 @@ impl StatsDb {
         let query_sql = format!(
             "SELECT id, created_at, model, route,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    duration_ms, streamed, status, error
+                    duration_ms, streamed, status, error, session_id, client
              FROM request_logs
              {}
              ORDER BY id DESC
@@ -445,6 +551,8 @@ impl StatsDb {
                 streamed: streamed_int != 0,
                 status: status_int as u16,
                 error: row.get(11)?,
+                session_id: row.get(12)?,
+                client: row.get(13)?,
             })
         })?;
 
@@ -457,6 +565,8 @@ impl StatsDb {
             items,
             total,
             models,
+            clients,
+            sessions,
         })
     }
 
@@ -607,6 +717,8 @@ mod tests {
             streamed,
             status,
             error,
+            session_id: "",
+            client: "",
         }
     }
 
@@ -800,6 +912,56 @@ mod tests {
         let stats = db.query_date("2026-09-22").unwrap();
         assert_eq!(stats.requests_total, 1, "date backfilled from created_at");
         assert_eq!(stats.requests_success, 1);
+    }
+
+    #[test]
+    fn sessions_are_listed_db_wide_not_just_from_the_current_page() {
+        // The dropdown must offer conversations that are not on the visible
+        // page, otherwise an older chat cannot be selected at all.
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord::default();
+
+        let mut outcomes = Vec::new();
+        for (session, client) in [
+            ("claude:aaa", "claude"),
+            ("claude:aaa", "claude"), // a second turn of the same chat
+            ("codex:bbb", "codex"),
+            ("", "unknown"), // unidentified: must not appear as a session
+        ] {
+            let mut o = outcome("hy3", "/v1/messages", &tokens, 200, None, true);
+            o.session_id = session;
+            o.client = client;
+            outcomes.push(o);
+        }
+        for o in &outcomes {
+            db.record_request_log(o.clone()).unwrap();
+        }
+
+        // Ask for a single row: the session list must still be complete.
+        let res = db
+            .query_request_logs(&RequestLogFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(res.items.len(), 1, "page is limited to one row");
+        let ids: Vec<&str> = res.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["codex:bbb", "claude:aaa"], "newest first");
+        assert!(
+            !ids.iter().any(|id| id.is_empty()),
+            "an unidentified request is not a session"
+        );
+        assert_eq!(
+            res.sessions
+                .iter()
+                .find(|s| s.session_id == "claude:aaa")
+                .unwrap()
+                .client,
+            "claude"
+        );
+        // The duplicate turn collapses into one entry.
+        assert_eq!(res.sessions.len(), 2);
     }
 
     #[test]

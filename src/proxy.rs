@@ -3,11 +3,13 @@ use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai, responses};
 use crate::service;
+use crate::session::{self, ClientKind, SessionInfo};
 use crate::stats::{RequestOutcome, StatsDb, TokenRecord};
 use crate::translate::{pipeline, responses as responses_pipeline, stream};
-use crate::util::{format_headers, truncate};
+use crate::util::{format_headers, peek_json_body, truncate};
 use axum::{
     body::Body,
+    extract::{FromRequest, Request},
     http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
     Extension, Json,
@@ -64,8 +66,18 @@ pub async fn proxy_handler(
     Extension(service): Extension<Arc<service::ServiceController>>,
     Extension(stats): Extension<Arc<StatsDb>>,
     headers: HeaderMap,
-    Json(req): Json<anthropic::AnthropicRequest>,
+    request: Request,
 ) -> ProxyResult<Response> {
+    // Resolve the session before the body is consumed by `Json`. The raw bytes
+    // are parsed because the translation type deliberately drops
+    // `metadata.user_id` — the only session id Claude Code sends.
+    let (raw_body, request) = peek_json_body(request).await;
+    let session = resolve_session(&headers, raw_body.as_ref());
+    let tag = session.log_tag();
+    let Json(req): Json<anthropic::AnthropicRequest> = Json::from_request(request, &())
+        .await
+        .map_err(|e| ProxyError::Transform(e.to_string()))?;
+
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
 
@@ -73,10 +85,10 @@ pub async fn proxy_handler(
     gui_logs
         .push(
             "INFO",
-            format!("POST /v1/messages headers: {}", incoming_headers),
+            format!("POST /v1/messages {} headers: {}", tag, incoming_headers),
         )
         .await;
-    tracing::info!("POST /v1/messages headers: {}", incoming_headers);
+    tracing::info!("POST /v1/messages {} headers: {}", tag, incoming_headers);
 
     // The console shares this listener; a stopped service must not take it
     // offline, so answer with 503 instead of closing the port.
@@ -115,8 +127,8 @@ pub async fn proxy_handler(
         .push(
             "INFO",
             format!(
-                "POST /v1/messages model={} -> upstream={} stream={} msgs={} tools={}",
-                client_model, openai_req.model, is_streaming, message_count, tool_count
+                "POST /v1/messages {} model={} -> upstream={} stream={} msgs={} tools={}",
+                tag, client_model, openai_req.model, is_streaming, message_count, tool_count
             ),
         )
         .await;
@@ -133,6 +145,8 @@ pub async fn proxy_handler(
         is_streaming,
         "/v1/messages",
         start,
+        session.clone(),
+        tag.clone(),
     )
     .await;
 
@@ -145,6 +159,8 @@ pub async fn proxy_handler(
         &client_model,
         is_streaming,
         start,
+        &session,
+        &tag,
     )
     .await;
 
@@ -158,8 +174,15 @@ pub async fn responses_proxy_handler(
     Extension(service): Extension<Arc<service::ServiceController>>,
     Extension(stats): Extension<Arc<StatsDb>>,
     headers: HeaderMap,
-    Json(req): Json<responses::ResponsesRequest>,
+    request: Request,
 ) -> ProxyResult<Response> {
+    let (raw_body, request) = peek_json_body(request).await;
+    let session = resolve_session(&headers, raw_body.as_ref());
+    let tag = session.log_tag();
+    let Json(req): Json<responses::ResponsesRequest> = Json::from_request(request, &())
+        .await
+        .map_err(|e| ProxyError::Transform(e.to_string()))?;
+
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
 
@@ -167,10 +190,10 @@ pub async fn responses_proxy_handler(
     gui_logs
         .push(
             "INFO",
-            format!("POST /v1/responses headers: {}", incoming_headers),
+            format!("POST /v1/responses {} headers: {}", tag, incoming_headers),
         )
         .await;
-    tracing::info!("POST /v1/responses headers: {}", incoming_headers);
+    tracing::info!("POST /v1/responses {} headers: {}", tag, incoming_headers);
 
     if !service.is_running() {
         return Ok(service::service_unavailable_response());
@@ -204,8 +227,8 @@ pub async fn responses_proxy_handler(
         .push(
             "INFO",
             format!(
-                "POST /v1/responses model={} -> upstream={} stream={}",
-                client_model, openai_req.model, is_streaming
+                "POST /v1/responses {} model={} -> upstream={} stream={}",
+                tag, client_model, openai_req.model, is_streaming
             ),
         )
         .await;
@@ -222,6 +245,8 @@ pub async fn responses_proxy_handler(
         is_streaming,
         "/v1/responses",
         start,
+        session.clone(),
+        tag.clone(),
     )
     .await;
 
@@ -234,6 +259,8 @@ pub async fn responses_proxy_handler(
         &client_model,
         is_streaming,
         start,
+        &session,
+        &tag,
     )
     .await;
 
@@ -247,8 +274,15 @@ pub async fn chat_completions_proxy_handler(
     Extension(service): Extension<Arc<service::ServiceController>>,
     Extension(stats): Extension<Arc<StatsDb>>,
     headers: HeaderMap,
-    Json(mut req): Json<openai::OpenAIRequest>,
+    request: Request,
 ) -> ProxyResult<Response> {
+    let (raw_body, request) = peek_json_body(request).await;
+    let session = resolve_session(&headers, raw_body.as_ref());
+    let tag = session.log_tag();
+    let Json(mut req): Json<openai::OpenAIRequest> = Json::from_request(request, &())
+        .await
+        .map_err(|e| ProxyError::Transform(e.to_string()))?;
+
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
 
@@ -256,10 +290,17 @@ pub async fn chat_completions_proxy_handler(
     gui_logs
         .push(
             "INFO",
-            format!("POST /v1/chat/completions headers: {}", incoming_headers),
+            format!(
+                "POST /v1/chat/completions {} headers: {}",
+                tag, incoming_headers
+            ),
         )
         .await;
-    tracing::info!("POST /v1/chat/completions headers: {}", incoming_headers);
+    tracing::info!(
+        "POST /v1/chat/completions {} headers: {}",
+        tag,
+        incoming_headers
+    );
 
     if !service.is_running() {
         return Ok(service::service_unavailable_response());
@@ -314,8 +355,8 @@ pub async fn chat_completions_proxy_handler(
         .push(
             "INFO",
             format!(
-                "POST /v1/chat/completions model={} -> upstream={} stream={}",
-                client_model, req.model, is_streaming
+                "POST /v1/chat/completions {} model={} -> upstream={} stream={}",
+                tag, client_model, req.model, is_streaming
             ),
         )
         .await;
@@ -332,6 +373,8 @@ pub async fn chat_completions_proxy_handler(
         is_streaming,
         "/v1/chat/completions",
         start,
+        session.clone(),
+        tag.clone(),
     )
     .await;
 
@@ -344,10 +387,28 @@ pub async fn chat_completions_proxy_handler(
         &client_model,
         is_streaming,
         start,
+        &session,
+        &tag,
     )
     .await;
 
     result
+}
+
+/// Resolve the session identity of an incoming request.
+///
+/// Header sources are read first (they are the only ones available on
+/// body-less routes such as `GET /v1/models`), then the raw body fills the gap
+/// for the two dialects that carry the id in the payload — Claude Code's
+/// `metadata.user_id` and Codex's `prompt_cache_key`.
+///
+/// The client dialect is detected from the headers *before* the body is
+/// consulted, so a body field can only ever confirm an identity, never relabel
+/// a request that a different client clearly sent.
+fn resolve_session(headers: &HeaderMap, body: Option<&serde_json::Value>) -> SessionInfo {
+    let client = session::detect_client(headers);
+    let body_info = body.and_then(|b| session::detect_from_body(client, b));
+    session::merge(session::detect(headers), body_info)
 }
 
 /// HTTP status to report for a completed request (500 when it errored).
@@ -381,6 +442,8 @@ async fn finalize_request(
     client_model: &str,
     is_streaming: bool,
     start: Instant,
+    session: &SessionInfo,
+    tag: &str,
 ) {
     metrics::request_finished(start, status, is_streaming);
 
@@ -390,11 +453,12 @@ async fn finalize_request(
                 .push(
                     "INFO",
                     format!(
-                        "POST {} ok model={} stream={} {}ms",
+                        "POST {} ok model={} stream={} {}ms {}",
                         route,
                         client_model,
                         is_streaming,
-                        start.elapsed().as_millis()
+                        start.elapsed().as_millis(),
+                        tag
                     ),
                 )
                 .await;
@@ -410,13 +474,15 @@ async fn finalize_request(
                 streamed: is_streaming,
                 status,
                 error: Some(&message),
+                session_id: &session.session_id,
+                client: session.client.tag(),
             });
             gui_logs
                 .push(
                     "ERROR",
                     format!(
-                        "POST {} failed model={} stream={} {}ms | {}",
-                        route, client_model, is_streaming, duration_ms, message
+                        "POST {} failed model={} stream={} {}ms {} | {}",
+                        route, client_model, is_streaming, duration_ms, tag, message
                     ),
                 )
                 .await;
@@ -443,6 +509,8 @@ async fn forward_request(
     streaming: bool,
     route: &'static str,
     start: Instant,
+    session: SessionInfo,
+    tag: String,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
@@ -529,10 +597,11 @@ async fn forward_request(
                         .push(
                             "ERROR",
                             format!(
-                                "UPSTREAM ERROR [connect] url={} model={} {}ms | {}",
+                                "UPSTREAM ERROR [connect] url={} model={} {}ms {} | {}",
                                 url,
                                 openai_req.model,
                                 upstream_start.elapsed().as_millis(),
+                                tag,
                                 err
                             ),
                         )
@@ -558,6 +627,7 @@ async fn forward_request(
                     status.as_u16(),
                     &body,
                     elapsed,
+                    &tag,
                 )
                 .await;
 
@@ -570,8 +640,9 @@ async fn forward_request(
                         .push(
                             "ERROR",
                             format!(
-                                "REQUEST SHAPE model={} | {}",
+                                "REQUEST SHAPE model={} {} | {}",
                                 openai_req.model,
+                                tag,
                                 describe_message_shape(&openai_req.messages)
                             ),
                         )
@@ -591,8 +662,8 @@ async fn forward_request(
                         .push(
                             "WARN",
                             format!(
-                                "UPSTREAM content_blocked ({}) → 1 degraded retry (model={})",
-                                status, openai_req.model
+                                "UPSTREAM content_blocked ({}) → 1 degraded retry (model={}) {}",
+                                status, openai_req.model, tag
                             ),
                         )
                         .await;
@@ -615,8 +686,8 @@ async fn forward_request(
                         .push(
                             "WARN",
                             format!(
-                                "非流式被上游拒绝(11101) → 改用流式请求重试 (model={})",
-                                openai_req.model
+                                "非流式被上游拒绝(11101) → 改用流式请求重试 (model={}) {}",
+                                openai_req.model, tag
                             ),
                         )
                         .await;
@@ -631,6 +702,8 @@ async fn forward_request(
                         flavor,
                         route,
                         start,
+                        &session,
+                        &tag,
                         url,
                     )
                     .await;
@@ -663,6 +736,8 @@ async fn forward_request(
                     start,
                     gui_logs,
                     stats,
+                    session,
+                    tag,
                 )
             } else {
                 // The client wants one JSON body. If the request was upgraded
@@ -682,6 +757,8 @@ async fn forward_request(
                     start,
                     &config,
                     stats,
+                    &session,
+                    &tag,
                 )
                 .await
             };
@@ -861,6 +938,8 @@ async fn non_streaming_response(
     start: Instant,
     config: &Config,
     stats: Arc<StatsDb>,
+    session: &SessionInfo,
+    tag: &str,
 ) -> ProxyResult<Response> {
     let metrics_model = match flavor {
         ApiFlavor::Chat => &client_model,
@@ -883,12 +962,15 @@ async fn non_streaming_response(
         streamed: false,
         status: 200,
         error: None,
+        session_id: &session.session_id,
+        client: session.client.tag(),
     });
 
     if config.verbose {
         tracing::trace!(
-            "Received OpenAI response: {}",
-            serde_json::to_string_pretty(&openai_resp).unwrap_or_default()
+            "Received OpenAI response: {} {}",
+            serde_json::to_string_pretty(&openai_resp).unwrap_or_default(),
+            tag
         );
     }
 
@@ -925,6 +1007,7 @@ async fn non_streaming_response(
 }
 
 /// Build the SSE response for a successful streaming upstream response.
+#[allow(clippy::too_many_arguments)]
 fn streaming_response(
     response: reqwest::Response,
     flavor: ApiFlavor,
@@ -933,6 +1016,8 @@ fn streaming_response(
     start: Instant,
     gui_logs: Arc<crate::settings::LogBuffer>,
     stats: Arc<StatsDb>,
+    session: SessionInfo,
+    tag: String,
 ) -> ProxyResult<Response> {
     let upstream = response.bytes_stream();
     let sse_stream = create_flavor_sse_stream(
@@ -943,6 +1028,8 @@ fn streaming_response(
         start,
         gui_logs,
         stats,
+        session,
+        tag,
     );
 
     let mut headers = HeaderMap::new();
@@ -967,19 +1054,23 @@ pub async fn list_models_handler(
 ) -> ProxyResult<Response> {
     let api_key = resolve_api_key(&config, &headers);
 
+    // No body on this route, so header sources are the only ones available.
+    let session = resolve_session(&headers, None);
+    let tag = session.log_tag();
+
     let incoming_headers = format_headers(&headers);
     gui_logs
         .push(
             "INFO",
-            format!("GET /v1/models headers: {}", incoming_headers),
+            format!("GET /v1/models {} headers: {}", tag, incoming_headers),
         )
         .await;
-    tracing::info!("GET /v1/models headers: {}", incoming_headers);
+    tracing::info!("GET /v1/models {} headers: {}", tag, incoming_headers);
 
     // Vendors like WorkBuddy publish their catalog on a custom config
     // endpoint instead of the OpenAI `/v1/models` route; honour it.
     if config.models_flavor == ModelsFlavor::WorkBuddyConfig {
-        return list_models_via_config(&config, &client, &api_key, &gui_logs).await;
+        return list_models_via_config(&config, &client, &api_key, &gui_logs, &tag).await;
     }
 
     let urls = config.models_urls();
@@ -1037,6 +1128,7 @@ async fn list_models_via_config(
     client: &Client,
     api_key: &Option<String>,
     gui_logs: &Arc<crate::settings::LogBuffer>,
+    tag: &str,
 ) -> ProxyResult<Response> {
     let Some(url) = config.models_config_url.clone() else {
         return Err(ProxyError::Upstream(
@@ -1080,8 +1172,9 @@ async fn list_models_via_config(
         .push(
             "INFO",
             format!(
-                "GET /v1/models (vendor config) -> {} models",
-                openai_resp.data.len()
+                "GET /v1/models (vendor config) -> {} models {}",
+                openai_resp.data.len(),
+                tag
             ),
         )
         .await;
@@ -1220,6 +1313,8 @@ async fn retry_as_stream(
     flavor: ApiFlavor,
     route: &'static str,
     start: Instant,
+    session: &SessionInfo,
+    tag: &str,
     url: &str,
 ) -> ProxyResult<Response> {
     let mut streamed_req = openai_req.clone();
@@ -1253,7 +1348,10 @@ async fn retry_as_stream(
     gui_logs
         .push(
             "INFO",
-            format!("流式重试成功，已聚合为单次响应 (model={})", client_model),
+            format!(
+                "流式重试成功，已聚合为单次响应 (model={}) {}",
+                client_model, tag
+            ),
         )
         .await;
     non_streaming_response(
@@ -1265,6 +1363,8 @@ async fn retry_as_stream(
         start,
         config,
         stats.clone(),
+        session,
+        tag,
     )
     .await
 }
@@ -1386,6 +1486,7 @@ fn upstream_code_hint(body: &str) -> Option<&'static str> {
 }
 
 /// Push a structured upstream failure into the GUI log buffer (and tracing).
+#[allow(clippy::too_many_arguments)]
 async fn log_upstream_failure(
     gui_logs: &Arc<crate::settings::LogBuffer>,
     stage: &str,
@@ -1394,11 +1495,12 @@ async fn log_upstream_failure(
     status: u16,
     body: &str,
     elapsed_ms: u128,
+    tag: &str,
 ) {
     let summary = describe_upstream_error(status, body);
     let mut msg = format!(
-        "UPSTREAM ERROR [{}] url={} model={} {}ms | {}",
-        stage, url, model, elapsed_ms, summary
+        "UPSTREAM ERROR [{}] url={} model={} {}ms {} | {}",
+        stage, url, model, elapsed_ms, tag, summary
     );
     if let Some(hint) = upstream_code_hint(body) {
         msg.push_str(&format!(" | hint: {}", hint));
@@ -1462,18 +1564,27 @@ struct StreamLedger {
     route: &'static str,
     start: Instant,
     stats: Arc<StatsDb>,
+    /// Session identity for the row this ledger writes on drop.
+    session: SessionInfo,
     tokens: TokenRecord,
     /// Set when the upstream stream failed; turns the row's status into a 500.
     error: Option<String>,
 }
 
 impl StreamLedger {
-    fn new(model: String, route: &'static str, start: Instant, stats: Arc<StatsDb>) -> Self {
+    fn new(
+        model: String,
+        route: &'static str,
+        start: Instant,
+        stats: Arc<StatsDb>,
+        session: SessionInfo,
+    ) -> Self {
         Self {
             model,
             route,
             start,
             stats,
+            session,
             tokens: TokenRecord::default(),
             error: None,
         }
@@ -1491,6 +1602,8 @@ impl Drop for StreamLedger {
             streamed: true,
             status,
             error: self.error.as_deref(),
+            session_id: &self.session.session_id,
+            client: self.session.client.tag(),
         });
     }
 }
@@ -1500,6 +1613,7 @@ impl Drop for StreamLedger {
 /// All three read the upstream's OpenAI-style `data: {...}` stream and differ
 /// only in how each chunk is translated and re-serialized, so the buffering,
 /// `[DONE]` handling, business-error detection and stats capture live here once.
+#[allow(clippy::too_many_arguments)]
 fn create_flavor_sse_stream(
     upstream: impl Stream<Item = Result<Bytes, impl std::fmt::Display + Send + 'static>>
         + Send
@@ -1510,6 +1624,8 @@ fn create_flavor_sse_stream(
     start: Instant,
     gui_logs: Arc<crate::settings::LogBuffer>,
     stats: Arc<StatsDb>,
+    session: SessionInfo,
+    tag: String,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         // Records the request row when the stream ends — including when the
@@ -1523,7 +1639,11 @@ fn create_flavor_sse_stream(
         // after the last yield would ever run. Holding the recording in a guard
         // tied to this generator's lifetime makes the row independent of how
         // far the client read.
-        let mut ledger = StreamLedger::new(client_model.clone(), route, start, stats.clone());
+        // Read before `session` is moved into the ledger below; drives the
+        // Codex stall diagnostic at the end of the stream.
+        let client_kind = session.client;
+        let mut ledger =
+            StreamLedger::new(client_model.clone(), route, start, stats.clone(), session);
         let mut buffer = String::new();
         let mut usage_captured = false;
 
@@ -1641,7 +1761,10 @@ fn create_flavor_sse_stream(
                                         .map(|s| s.model().to_string())
                                         .or_else(|| responses_state.as_ref().map(|s| s.model().to_string()))
                                         .unwrap_or_else(|| client_model.clone());
-                                    let msg = format!("UPSTREAM ERROR [stream] model={} | {}", model, summary);
+                                    let msg = format!(
+                                        "UPSTREAM ERROR [stream] model={} {} | {}",
+                                        model, tag, summary
+                                    );
                                     gui_logs.push("ERROR", msg.clone()).await;
                                     tracing::warn!("{}", msg);
 
@@ -1697,7 +1820,8 @@ fn create_flavor_sse_stream(
                             }
                         }
                         ApiFlavor::Chat => {
-                            let msg = format!("STREAM READ ERROR model={} | {}", client_model, e);
+                            let msg =
+                                format!("STREAM READ ERROR model={} {} | {}", client_model, tag, e);
                             gui_logs.push("ERROR", msg.clone()).await;
                             tracing::warn!("{}", msg);
                         }
@@ -1715,6 +1839,20 @@ fn create_flavor_sse_stream(
             if let Some(state) = responses_state.as_mut() {
                 for event in responses_pipeline::translate_stream_done(state) {
                     yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
+                }
+                // Flag the stall symptom: Codex reads the Responses stream for its next
+                // *action*. If a turn closes with natural-language text but no tool call,
+                // there is nothing for the client to execute and it silently freezes — the
+                // "said it would do X, then stopped" report. This WARN makes that self-evident
+                // in the logs immediately before the user sees the stall.
+                let s = state.summary();
+                if client_kind == ClientKind::Codex && s.started_tool_calls == 0 && s.text_len > 0 {
+                    let msg = format!(
+                        "RESPONSES text-only turn (no tool call) — Codex may stall waiting for an action | text_len={} active_tool_calls={} {}",
+                        s.text_len, s.active_tool_calls, tag
+                    );
+                    gui_logs.push("WARN", msg.clone()).await;
+                    tracing::warn!("{}", msg);
                 }
             }
             yield Ok(Bytes::from("data: [DONE]\n\n"));
@@ -1740,6 +1878,8 @@ fn create_sse_stream(
         Instant::now(),
         gui_logs,
         stats,
+        SessionInfo::unknown(),
+        "client=unknown".to_string(),
     )
 }
 
@@ -1760,14 +1900,30 @@ fn create_responses_sse_stream(
         Instant::now(),
         gui_logs,
         stats,
+        SessionInfo::unknown(),
+        "client=unknown".to_string(),
     )
+}
+
+/// Build a raw request whose body is `value`, so a handler test exercises the
+/// same "peek the body, then hand it to `Json`" path as production.
+#[cfg(test)]
+fn json_request<T: serde::Serialize>(value: &T) -> Request {
+    Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(value).expect("test body serializes"),
+        ))
+        .expect("test request builds")
 }
 
 #[cfg(test)]
 mod tests {
     use super::create_sse_stream;
+    use super::json_request;
     use super::{apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported};
     use crate::models::{openai, responses};
+    use crate::session::SessionInfo;
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
@@ -2516,7 +2672,21 @@ mod tests {
         let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
         let service = crate::service::ServiceController::new(8080, false);
         service.mark_running(8080);
-        let headers = HeaderMap::new();
+        // The real Codex header set, reduced to the fields the session
+        // resolver reads, so this test also proves the end-to-end attribution.
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", "Codex".parse().unwrap());
+        headers.insert(
+            "session-id",
+            "01a0cc30-3318-74d2-b045-650a0b0c2e1c".parse().unwrap(),
+        );
+        headers.insert(
+            "x-codex-turn-metadata",
+            r#"{"session_id":"01a0cc30-3318-74d2-b045-650a0b0c2e1c","turn_id":"01a0cc31-bc18-77c3-85d8-de3c452f781c"}"#
+                .parse()
+                .unwrap(),
+        );
+        let stats_db = mock_stats();
         let req = responses::ResponsesRequest {
             model: "gpt-4o".to_string(),
             input: responses::ResponsesInput::Text("Hello proxy".to_string()),
@@ -2538,16 +2708,57 @@ mod tests {
         let response = super::responses_proxy_handler(
             axum::Extension(config),
             axum::Extension(client),
-            axum::Extension(logs),
+            axum::Extension(logs.clone()),
             axum::Extension(service),
-            axum::Extension(mock_stats()),
+            axum::Extension(stats_db.clone()),
             headers,
-            Json(req),
+            json_request(&req),
         )
         .await
         .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // The session must reach the log line, the request-log row and the
+        // stats filter, which is the entire point of the change.
+        let lines = logs.snapshot().await;
+        let headers_line = lines
+            .iter()
+            .find(|l| l.message.starts_with("POST /v1/responses client=codex"))
+            .expect("headers line carries the resolved session");
+        assert!(
+            headers_line
+                .message
+                .contains("session_id=codex:01a0cc30-3318-74d2-b045-650a0b0c2e1c"),
+            "unexpected log line: {}",
+            headers_line.message
+        );
+        assert!(
+            headers_line
+                .message
+                .contains("turn=01a0cc31-bc18-77c3-85d8-de3c452f781c"),
+            "unexpected log line: {}",
+            headers_line.message
+        );
+
+        let rows = stats_db
+            .query_request_logs(&crate::stats::RequestLogFilter {
+                session_id: Some("codex:01a0cc30-3318-74d2-b045-650a0b0c2e1c".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.items.len(), 1, "row is filterable by session id");
+        assert_eq!(rows.items[0].client, "codex");
+        assert_eq!(rows.clients, vec!["codex".to_string()]);
+
+        // A different session must not match.
+        let other = stats_db
+            .query_request_logs(&crate::stats::RequestLogFilter {
+                session_id: Some("codex:00000000-0000-7000-8000-000000000000".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(other.items.len(), 0);
     }
 
     #[tokio::test]
@@ -2620,7 +2831,7 @@ mod tests {
             axum::Extension(service),
             axum::Extension(mock_stats()),
             headers,
-            Json(req),
+            json_request(&req),
         )
         .await
         .unwrap();
@@ -2850,7 +3061,7 @@ mod tests {
             axum::Extension(service),
             axum::Extension(stats_db.clone()),
             HeaderMap::new(),
-            Json(req),
+            json_request(&req),
         )
         .await
         .unwrap();
@@ -2985,7 +3196,7 @@ mod tests {
             axum::Extension(service),
             axum::Extension(stats_db.clone()),
             HeaderMap::new(),
-            Json(req),
+            json_request(&req),
         )
         .await
         .unwrap();
@@ -3128,7 +3339,7 @@ mod tests {
             axum::Extension(service),
             axum::Extension(mock_stats()),
             HeaderMap::new(),
-            Json(req),
+            json_request(&req),
         )
         .await
         .unwrap();
@@ -3364,6 +3575,8 @@ mod tests {
             false,
             "/v1/chat/completions",
             std::time::Instant::now(),
+            SessionInfo::unknown(),
+            "client=unknown".to_string(),
         )
         .await
         .unwrap();

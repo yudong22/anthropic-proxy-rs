@@ -598,6 +598,35 @@ impl ResponsesStreamState {
             .as_deref()
             .unwrap_or(self.fallback_model.as_str())
     }
+
+    /// A compact summary of what this streamed turn actually produced, used to
+    /// flag stalls. Codex reads the Responses stream for *actions*; if a turn
+    /// closes with text but no tool call, the client has nothing to execute and
+    /// simply stops — exactly the "said it would do X, then froze" symptom. The
+    /// raw `active_tool_calls` count is reported alongside the *started* count so
+    /// a model that emitted a bare `tool_calls` delta without an id/name (a known
+    /// non-OpenAI-upstream shape) is distinguishable from one that emitted none.
+    pub fn summary(&self) -> ResponsesTurnSummary {
+        let active_tool_calls = self.active_tool_calls.len();
+        let started_tool_calls = self.active_tool_calls.iter().filter(|t| t.started).count();
+        ResponsesTurnSummary {
+            text_len: self.accumulated_text.chars().count(),
+            active_tool_calls,
+            started_tool_calls,
+        }
+    }
+}
+
+/// What an upstream streamed turn resolved into, for stall diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsesTurnSummary {
+    /// Characters of assistant text accumulated this turn.
+    pub text_len: usize,
+    /// Tool-call slots the upstream opened (may exceed `started_tool_calls` when
+    /// a call arrived without an id/name and was therefore never emitted).
+    pub active_tool_calls: usize,
+    /// Tool calls that actually became `function_call` items Codex can run.
+    pub started_tool_calls: usize,
 }
 
 /// Translates a single incoming OpenAI `StreamChunk` into a series of `ResponsesStreamEvent`s.
@@ -1461,6 +1490,68 @@ mod tests {
 
         assert_eq!(resp.usage.as_ref().unwrap().total_tokens, 18);
         assert!(resp.response.is_some());
+    }
+
+    /// A chunk carrying a tool-call delta, as the upstream opens a call: the
+    /// first delta names the function, later ones stream the arguments.
+    fn tool_chunk(index: usize, id: Option<&str>, name: Option<&str>) -> openai::StreamChunk {
+        let mut chunk = upstream_chunk("", None);
+        chunk.choices[0].delta.content = None;
+        chunk.choices[0].delta.tool_calls = Some(vec![openai::DeltaToolCall {
+            index,
+            id: id.map(str::to_string),
+            call_type: Some("function".to_string()),
+            function: Some(openai::DeltaFunctionCall {
+                name: name.map(str::to_string),
+                arguments: Some(String::new()),
+            }),
+        }]);
+        chunk
+    }
+
+    #[test]
+    fn summary_flags_a_text_only_turn_as_unactionable() {
+        // The stall diagnostic: text with no started tool call means Codex has
+        // nothing to execute. The summary must make both halves visible.
+        let mut state = initial_stream_state("glm-5.3-flash".to_string());
+        translate_stream_chunk(
+            &mut state,
+            &upstream_chunk("I'll fix that now.", Some("stop")),
+        );
+
+        let s = state.summary();
+        assert_eq!(s.text_len, "I'll fix that now.".chars().count());
+        assert_eq!(s.started_tool_calls, 0, "no tool call was opened");
+        assert_eq!(s.active_tool_calls, 0);
+    }
+
+    #[test]
+    fn summary_counts_a_started_tool_call() {
+        let mut state = initial_stream_state("gpt-4o".to_string());
+        translate_stream_chunk(&mut state, &upstream_chunk("Working on it.", None));
+        translate_stream_chunk(&mut state, &tool_chunk(0, Some("call_1"), Some("shell")));
+
+        let s = state.summary();
+        assert!(s.text_len > 0);
+        assert_eq!(
+            s.started_tool_calls, 1,
+            "a named call must count as started"
+        );
+        assert_eq!(s.active_tool_calls, 1);
+    }
+
+    #[test]
+    fn summary_separates_a_bare_slot_from_a_started_call() {
+        // Some upstreams emit a `tool_calls` delta with neither id nor name —
+        // the slot exists but never started, so nothing was emitted to the
+        // client. Reporting both counts keeps that distinguishable from a
+        // model that emitted no tool call at all.
+        let mut state = initial_stream_state("gpt-4o".to_string());
+        translate_stream_chunk(&mut state, &tool_chunk(0, None, None));
+
+        let s = state.summary();
+        assert_eq!(s.active_tool_calls, 1, "the slot was opened");
+        assert_eq!(s.started_tool_calls, 0, "but no item reached the client");
     }
 
     /// A chunk exactly as WorkBuddy/copilot.tencent.com emits it:

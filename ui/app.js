@@ -21,6 +21,8 @@ let appState = {
   requestLogs: [],
   requestLogsTotal: 0,
   requestLogsModels: [],
+  requestLogsClients: [],
+  requestLogsSessions: [],
   requestLogsPage: 0,
   requestLogsPageSize: 50,
   logsViewMode: 'table', // 'table' | 'console'
@@ -211,6 +213,7 @@ const logAutoscroll = document.getElementById('log-autoscroll');
 const tableModelFilter = document.getElementById('table-model-filter');
 const tableStatusFilter = document.getElementById('table-status-filter');
 const tableStreamedFilter = document.getElementById('table-streamed-filter');
+const tableClientFilter = document.getElementById('table-client-filter');
 const tableSearchInput = document.getElementById('table-search-input');
 const requestLogsTbody = document.getElementById('request-logs-tbody');
 const tableLogCount = document.getElementById('table-log-count');
@@ -266,6 +269,7 @@ tableSearchInput?.addEventListener('input', () => {
 tableModelFilter?.addEventListener('change', () => fetchRequestLogs(true));
 tableStatusFilter?.addEventListener('change', () => fetchRequestLogs(true));
 tableStreamedFilter?.addEventListener('change', () => fetchRequestLogs(true));
+tableClientFilter?.addEventListener('change', () => fetchRequestLogs(true));
 
 document.getElementById('btn-refresh-table')?.addEventListener('click', () => {
   fetchRequestLogs(false);
@@ -306,6 +310,7 @@ async function fetchRequestLogs(resetPage = false) {
   const modelVal = tableModelFilter?.value || 'all';
   const statusVal = tableStatusFilter?.value || 'all';
   const streamVal = tableStreamedFilter?.value || 'all';
+  const clientVal = tableClientFilter?.value || 'all';
   const searchVal = tableSearchInput?.value.trim() || '';
 
   const filter = {
@@ -324,6 +329,14 @@ async function fetchRequestLogs(resetPage = false) {
   } else if (streamVal === 'sync') {
     filter.streamed = false;
   }
+  if (clientVal && clientVal !== 'all') {
+    // 'all:' is the "every session of this client" option.
+    if (clientVal.endsWith(':')) {
+      filter.client = clientVal.slice(0, -1);
+    } else {
+      filter.session_id = clientVal;
+    }
+  }
   if (searchVal) {
     filter.search = searchVal;
   }
@@ -334,7 +347,10 @@ async function fetchRequestLogs(resetPage = false) {
       appState.requestLogs = res.items || [];
       appState.requestLogsTotal = res.total || 0;
       appState.requestLogsModels = res.models || [];
+      appState.requestLogsClients = res.clients || [];
+      appState.requestLogsSessions = res.sessions || [];
       updateModelDropdown();
+      updateSessionDropdown();
       renderRequestLogs();
     }
   } catch (err) {
@@ -365,7 +381,7 @@ function renderRequestLogs() {
   const items = appState.requestLogs || [];
 
   if (items.length === 0) {
-    requestLogsTbody.innerHTML = `<tr><td colspan="8" class="table-empty">未匹配到任何请求记录</td></tr>`;
+    requestLogsTbody.innerHTML = `<tr><td colspan="9" class="table-empty">未匹配到任何请求记录</td></tr>`;
   } else {
     requestLogsTbody.innerHTML = items.map(item => {
       const isErr = (item.status >= 400 || item.error);
@@ -392,8 +408,16 @@ function renderRequestLogs() {
 
       const durationFormatted = formatDuration(item.duration_ms);
 
+      const sessionCell = item.session_id
+        ? `<div class="cell-session-box">
+             <span class="badge-pill client-pill client-${escapeHtml(item.client || 'unknown')}">${escapeHtml(item.client || 'unknown')}</span>
+             <span class="cell-session" title="${escapeHtml(item.session_id)}">${escapeHtml(shortSessionId(item.session_id))}</span>
+           </div>`
+        : `<span class="cell-session-none">—</span>`;
+
       return `<tr class="${rowClass}">
         <td class="cell-time">${escapeHtml(item.created_at)}</td>
+        <td>${sessionCell}</td>
         <td>
           <div class="cell-model-box">
             <span class="cell-model" title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</span>
@@ -440,6 +464,18 @@ function renderRequestLogs() {
   });
 }
 
+// `codex:01a0cc30-3318-74d2-b045-650a0b0c2e1c` -> `codex:01a0cc30`.
+// The full value stays in the cell's `title`, and in the log file.
+function shortSessionId(sessionId) {
+  if (!sessionId) return '';
+  const idx = sessionId.indexOf(':');
+  if (idx < 0) return sessionId;
+  const prefix = sessionId.slice(0, idx);
+  const rest = sessionId.slice(idx + 1);
+  const head = rest.split('-')[0] || rest;
+  return `${prefix}:${head.length < rest.length ? head : rest}`;
+}
+
 function formatDuration(ms) {
   if (!ms || ms <= 0) return '0ms';
   if (ms < 1000) return `${ms}ms`;
@@ -456,6 +492,12 @@ function showRequestModal(id) {
   if (!modalBody || !modalOverlay) return;
 
   const totalTokens = (item.input_tokens || 0) + (item.output_tokens || 0);
+  // Session identity belongs in the detail view: it is the key that ties this
+  // row to the other requests in the same conversation.
+  const sessionRows = item.session_id
+    ? `<tr><td class="detail-key">会话 ID</td><td class="detail-val"><span class="mono">${escapeHtml(item.session_id)}</span></td></tr>
+       <tr><td class="detail-key">客户端</td><td class="detail-val">${escapeHtml(item.client || 'unknown')}</td></tr>`
+    : `<tr><td class="detail-key">会话 ID</td><td class="detail-val">未识别</td></tr>`;
 
   let statusBadge = '';
   if (item.status >= 200 && item.status < 300) {
@@ -482,6 +524,7 @@ function showRequestModal(id) {
       <tr><td class="detail-key">时间</td><td class="detail-val">${escapeHtml(item.created_at)}</td></tr>
       <tr><td class="detail-key">模型 ID</td><td class="detail-val"><strong>${escapeHtml(item.model)}</strong></td></tr>
       <tr><td class="detail-key">请求路径</td><td class="detail-val">${escapeHtml(item.route)}</td></tr>
+      ${sessionRows}
       <tr><td class="detail-key">状态</td><td class="detail-val">${statusBadge}</td></tr>
       <tr><td class="detail-key">传输模式</td><td class="detail-val">${streamText}</td></tr>
       <tr><td class="detail-key">响应耗时</td><td class="detail-val">${formatDuration(item.duration_ms)} (${item.duration_ms} ms)</td></tr>
@@ -918,3 +961,44 @@ setInterval(() => {
     }
   }
 }, 2000);
+
+
+// Populate the session dropdown. Values are the exact `session_id`; a
+// `<client>:` entry (trailing colon) filters by client instead of by session, so
+// "all Codex requests" is one click. Built from what is actually in the DB, so
+// the list stays short.
+function updateSessionDropdown() {
+  if (!tableClientFilter) return;
+  const currentVal = tableClientFilter.value;
+  const clients = appState.requestLogsClients || [];
+  // Prefer the DB-wide list so a conversation whose latest request sits on an
+  // older page is still selectable; fall back to the visible page only when an
+  // older backend does not send `sessions`.
+  const fromDb = appState.requestLogsSessions || [];
+  const sessions = fromDb.length
+    ? fromDb
+    : appState.requestLogs
+        .filter(r => r.session_id)
+        .map(r => ({ session_id: r.session_id, client: r.client }))
+        .filter((s, i, all) => all.findIndex(o => o.session_id === s.session_id) === i);
+
+  const seenClients = clients.length
+    ? clients
+    : [...new Set(sessions.map(s => s.client).filter(Boolean))];
+
+  let html = `<option value="all">全部会话</option>`;
+  seenClients.forEach(c => {
+    html += `<option value="${escapeHtml(c)}:">仅 ${escapeHtml(c)}</option>`;
+  });
+  sessions.forEach(s => {
+    const label = s.client ? `${s.client} · ${s.session_id}` : s.session_id;
+    html += `<option value="${escapeHtml(s.session_id)}">${escapeHtml(label)}</option>`;
+  });
+
+  tableClientFilter.innerHTML = html;
+  if (currentVal && Array.from(tableClientFilter.options).some(o => o.value === currentVal)) {
+    tableClientFilter.value = currentVal;
+  } else {
+    tableClientFilter.value = 'all';
+  }
+}

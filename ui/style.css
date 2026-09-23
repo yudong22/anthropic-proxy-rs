@@ -504,6 +504,56 @@ code, pre, .mono {
   font-family: var(--mono);
 }
 
+.cell-session-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 150px;
+}
+
+.cell-session {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-session-none {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* One colour per client dialect, so a mixed log can be scanned by hue even
+   before the dropdown is touched. */
+.client-pill {
+  background: rgba(120, 130, 150, .14);
+  color: var(--muted);
+  border: 1px solid rgba(120, 130, 150, .25);
+  font-size: 10px;
+  padding: 1px 6px;
+  flex: 0 0 auto;
+}
+
+.client-pill.client-codex {
+  background: rgba(16, 163, 127, .12);
+  color: #10a37f;
+  border-color: rgba(16, 163, 127, .3);
+}
+
+.client-pill.client-claude {
+  background: rgba(216, 119, 76, .14);
+  color: #d8774c;
+  border-color: rgba(216, 119, 76, .32);
+}
+
+.client-pill.client-dsh {
+  background: rgba(90, 130, 220, .14);
+  color: #5a82dc;
+  border-color: rgba(90, 130, 220, .32);
+}
+
 .cell-num {
   font-family: var(--mono);
   text-align: right;

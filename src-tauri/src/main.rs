@@ -615,17 +615,29 @@ fn run_proxy_server(
         );
 
         let bind_addr = config_arc.bind.clone();
+        // No `+1` fallback: every client CLI is pointed at one fixed gateway
+        // URL, so binding a different port would break them invisibly. The
+        // single-instance guard is what keeps this port free.
         let (listener, bound_port) = match service::ServiceController::bind(
             &bind_addr,
             config_arc.port,
-            ctx.service_ctrl.auto_fallback(),
+            ctx.service_ctrl.allow_port_fallback(),
         )
         .await
         {
             Ok(v) => v,
             Err(e) => {
+                let in_use = e.kind() == std::io::ErrorKind::AddrInUse;
+                let hint = if in_use {
+                    "（端口已被占用：请先退出另一个 Anthropic Proxy 实例，或改用其它端口）"
+                } else {
+                    ""
+                };
                 ctx.logs
-                    .push("ERROR", format!("代理监听端口绑定失败: {}", e))
+                    .push(
+                        "ERROR",
+                        format!("代理监听端口绑定失败 {}: {}{}", config_arc.port, e, hint),
+                    )
                     .await;
                 ctx.service_ctrl.mark_stopped();
                 update_tray_state(&app, &ctx);
@@ -732,6 +744,26 @@ fn main() {
     let ctx_for_tray = ctx.clone();
 
     tauri::Builder::default()
+        // Registered first, as the plugin requires: on a second launch this
+        // process is killed immediately and the callback runs in the original
+        // instance, which reveals its window. That keeps the proxy bound to the
+        // one port the client CLIs are configured against instead of leaving a
+        // second, portless copy in the Dock.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            focus_main_window(app);
+            let ctx = app.state::<Arc<AppContext>>().inner().clone();
+            // A second launch means "I could not find the window": if the
+            // service was stopped, start it too, so the app always ends up in a
+            // usable state.
+            if !ctx.service_ctrl.is_running() {
+                request_start(app.clone(), ctx.clone());
+            }
+            tauri::async_runtime::spawn(async move {
+                ctx.logs
+                    .push("INFO", "重复启动已合并到当前实例".to_string())
+                    .await;
+            });
+        }))
         .manage(ctx)
         .setup(move |app| {
             let app_handle = app.handle().clone();

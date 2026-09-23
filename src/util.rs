@@ -1,6 +1,9 @@
 //! Small shared helpers used across the proxy, stats and credits modules.
 
-use axum::http::HeaderMap;
+use axum::{
+    body::{to_bytes, Body},
+    http::{HeaderMap, Request},
+};
 
 /// Truncate `text` to at most `max` characters, appending an ellipsis when cut.
 ///
@@ -29,6 +32,27 @@ pub fn format_headers(headers: &HeaderMap) -> String {
         .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<non-utf8>")))
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+/// Parse a JSON body from the exact bytes the client sent.
+///
+/// Used at the top of a handler, before `Json<T>` consumes the body: `T` is the
+/// *translation* model, which deliberately drops fields this proxy does not
+/// forward, so the typed request cannot be the source of truth for something
+/// the client told us (e.g. Claude Code's `metadata.user_id`). Reading the raw
+/// bytes keeps that information without widening a translation type for what is
+/// purely a logging concern.
+///
+/// Returns `None` on any problem — a non-JSON body, a body that will not buffer
+/// — so a caller can treat a logging aid as strictly optional. The extracted
+/// [`Request`] is handed back for `Json` to re-consume.
+pub async fn peek_json_body(req: Request<Body>) -> (Option<serde_json::Value>, Request<Body>) {
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = to_bytes(body, usize::MAX).await else {
+        return (None, Request::from_parts(parts, Body::empty()));
+    };
+    let parsed = serde_json::from_slice(&bytes).ok();
+    (parsed, Request::from_parts(parts, Body::from(bytes)))
 }
 
 /// Convert days since the Unix epoch to a `(year, month, day)` civil date.

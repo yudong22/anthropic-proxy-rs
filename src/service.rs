@@ -16,16 +16,23 @@ pub struct ServiceController {
     running: AtomicBool,
     port: AtomicU16,
     preferred_port: AtomicU16,
-    auto_fallback: bool,
+    /// Whether to retry `preferred + 1` when the preferred port is taken.
+    ///
+    /// Off in the desktop app: the client CLIs are configured against one fixed
+    /// gateway URL, so silently binding a different port breaks them with no
+    /// visible cause. A busy port is surfaced as an error instead, and the
+    /// single-instance guard is what actually prevents the conflict (see
+    /// `src-tauri/src/main.rs`).
+    allow_port_fallback: AtomicBool,
 }
 
 impl ServiceController {
-    pub fn new(preferred_port: u16, auto_fallback: bool) -> Arc<Self> {
+    pub fn new(preferred_port: u16, allow_port_fallback: bool) -> Arc<Self> {
         Arc::new(Self {
             running: AtomicBool::new(false),
             port: AtomicU16::new(0),
             preferred_port: AtomicU16::new(preferred_port),
-            auto_fallback,
+            allow_port_fallback: AtomicBool::new(allow_port_fallback),
         })
     }
 
@@ -42,8 +49,14 @@ impl ServiceController {
         self.preferred_port.store(port, Ordering::SeqCst);
     }
 
-    pub fn auto_fallback(&self) -> bool {
-        self.auto_fallback
+    pub fn allow_port_fallback(&self) -> bool {
+        self.allow_port_fallback.load(Ordering::SeqCst)
+    }
+
+    /// Retry `preferred + 1` when the preferred port is busy. The desktop app
+    /// leaves this off so the configured port is the only one ever used.
+    pub fn set_allow_port_fallback(&self, allow: bool) {
+        self.allow_port_fallback.store(allow, Ordering::SeqCst);
     }
 
     pub fn mark_running(&self, port: u16) {
@@ -59,14 +72,18 @@ impl ServiceController {
     }
 
     /// Bind the preferred port, falling back to `preferred + 1` when allowed.
+    ///
+    /// `allow_fallback` is passed in rather than read from the controller so
+    /// the caller decides per bind; the desktop app passes `false`, which makes
+    /// a busy port a hard error instead of a silent retarget.
     pub async fn bind(
         bind_addr: &str,
         preferred: u16,
-        auto_fallback: bool,
+        allow_fallback: bool,
     ) -> std::io::Result<(tokio::net::TcpListener, u16)> {
         match tokio::net::TcpListener::bind(format!("{bind_addr}:{preferred}")).await {
             Ok(l) => Ok((l, preferred)),
-            Err(e) if auto_fallback => {
+            Err(e) if allow_fallback => {
                 let fallback = preferred.saturating_add(1);
                 eprintln!("⚠️  Port {preferred} is busy ({e}), falling back to {fallback}");
                 let l = tokio::net::TcpListener::bind(format!("{bind_addr}:{fallback}")).await?;
