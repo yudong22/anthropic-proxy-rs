@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -218,12 +219,75 @@ impl DayStats {
 ///
 /// Queries use their own connection; WAL mode lets them read while the writer
 /// thread holds the write lock.
+///
+/// For a file-backed database, reads draw from a small pool instead of sharing
+/// one connection. WAL already permits concurrent readers at the SQLite level,
+/// so the bottleneck was the single `Mutex` serializing them: the GUI polls
+/// both the stats line and the request-log table every two seconds, and one
+/// shared lock made those queries queue behind each other.
+///
+/// An in-memory database cannot be shared across connections — a second
+/// connection would be a *different*, empty database — so those fall back to
+/// the single shared handle, which is correct for tests and the non-persistent
+/// fallback the GUI uses when the real file cannot be opened.
 pub struct StatsDb {
-    /// Connection used for reads (and for writes in inline/test mode).
+    /// Read connections, checked out for the duration of a query. Only used
+    /// when `reader_source` is set; otherwise `conn` serves every read.
+    readers: Mutex<Vec<Connection>>,
+    /// Path to open additional read connections from. `None` for in-memory
+    /// databases, which cannot be reopened.
+    reader_source: Option<PathBuf>,
+    /// The connection used for writes in inline mode (no writer thread) and for
+    /// every read when the database is in-memory.
     conn: Arc<Mutex<Connection>>,
     /// Queue feeding the background writer thread. `None` in inline mode,
     /// where writes go straight through `conn`.
     queue: Option<Sender<RequestRow>>,
+}
+
+/// Upper bound on pooled read connections.
+///
+/// The GUI issues two pollers; a handful of spare connections covers that plus
+/// an ad-hoc query, without opening unbounded handles on a desktop app.
+const MAX_READ_CONNS: usize = 4;
+
+/// Where a read should come from: a pooled connection (file-backed) or the
+/// single shared handle (in-memory).
+enum ReadHandle<'a> {
+    Pooled(ReadConn<'a>),
+    Shared(std::sync::MutexGuard<'a, Connection>),
+}
+
+impl ReadHandle<'_> {
+    fn get(&self) -> &Connection {
+        match self {
+            ReadHandle::Pooled(r) => r.get(),
+            ReadHandle::Shared(g) => g,
+        }
+    }
+}
+
+/// A read connection borrowed from the pool, returned on drop.
+struct ReadConn<'a> {
+    pool: &'a Mutex<Vec<Connection>>,
+    conn: Option<Connection>,
+}
+
+impl ReadConn<'_> {
+    fn get(&self) -> &Connection {
+        // `Some` for the guard's whole life; `take` only happens in `Drop`.
+        self.conn.as_ref().expect("read connection checked out")
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            if let Ok(mut pool) = self.pool.lock() {
+                pool.push(conn);
+            }
+        }
+    }
 }
 
 impl StatsDb {
@@ -238,10 +302,17 @@ impl StatsDb {
                 ))
             }
         };
+        Self::open_at(&path)
+    }
 
-        let read_conn = Self::connect(&path)?;
-        Self::init_schema(&read_conn)?;
-        let write_conn = Self::connect(&path)?;
+    /// Open a file-backed database at an explicit path.
+    ///
+    /// Split from [`open`] so tests can use a temp file instead of the user's
+    /// real `~/.proxy-rs/stats.db`.
+    pub fn open_at(path: &std::path::Path) -> Result<Arc<Self>> {
+        let seed_conn = Self::connect(path)?;
+        Self::init_schema(&seed_conn)?;
+        let write_conn = Self::connect(path)?;
 
         let (tx, rx) = channel::<RequestRow>();
         std::thread::Builder::new()
@@ -249,7 +320,9 @@ impl StatsDb {
             .spawn(move || writer_loop(write_conn, rx))?;
 
         Ok(Arc::new(Self {
-            conn: Arc::new(Mutex::new(read_conn)),
+            readers: Mutex::new(vec![seed_conn]),
+            reader_source: Some(path.to_path_buf()),
+            conn: Arc::new(Mutex::new(Connection::open_in_memory()?)),
             queue: Some(tx),
         }))
     }
@@ -260,6 +333,8 @@ impl StatsDb {
     /// visible to queries.
     pub fn from_conn(conn: Connection) -> Self {
         Self {
+            readers: Mutex::new(Vec::new()),
+            reader_source: None,
             conn: Arc::new(Mutex::new(conn)),
             queue: None,
         }
@@ -271,9 +346,44 @@ impl StatsDb {
         let conn = Connection::open_in_memory()?;
         Self::init_schema(&conn)?;
         Ok(Arc::new(Self {
+            readers: Mutex::new(Vec::new()),
+            reader_source: None,
             conn: Arc::new(Mutex::new(conn)),
             queue: None,
         }))
+    }
+
+    /// Borrow a connection for a read query.
+    ///
+    /// A file-backed database hands out a pooled connection so concurrent
+    /// readers do not serialize on one lock. In-memory databases share the
+    /// single handle: a second connection would be a different, empty database.
+    fn read_conn(&self) -> ReadHandle<'_> {
+        let Some(path) = self.reader_source.as_ref() else {
+            return ReadHandle::Shared(self.conn.lock().unwrap_or_else(|p| p.into_inner()));
+        };
+
+        if let Some(conn) = self.readers.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+            return ReadHandle::Pooled(ReadConn {
+                pool: &self.readers,
+                conn: Some(conn),
+            });
+        }
+
+        // Pool empty: open another up to the cap, else share the single handle
+        // rather than making the reader wait.
+        let room = self
+            .readers
+            .lock()
+            .map(|p| p.len() < MAX_READ_CONNS)
+            .unwrap_or(false);
+        match room.then(|| Self::connect(path).ok()).flatten() {
+            Some(conn) => ReadHandle::Pooled(ReadConn {
+                pool: &self.readers,
+                conn: Some(conn),
+            }),
+            None => ReadHandle::Shared(self.conn.lock().unwrap_or_else(|p| p.into_inner())),
+        }
     }
 
     fn connect(path: &std::path::Path) -> Result<Connection> {
@@ -390,7 +500,10 @@ impl StatsDb {
 
     /// Query request logs with optional filtering and pagination.
     pub fn query_request_logs(&self, filter: &RequestLogFilter) -> Result<RequestLogsResult> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // Pooled: this runs five queries in a row, so holding the one shared
+        // lock would block the GUI's other poller for that whole span.
+        let handle = self.read_conn();
+        let conn = handle.get();
 
         // 1. Fetch distinct models for filter dropdown
         let mut model_stmt =
@@ -572,8 +685,11 @@ impl StatsDb {
 
     /// Clear all request logs from the database.
     pub fn clear_request_logs(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.execute("DELETE FROM request_logs", [])?;
+        // A write, but it needs a connection that sees the same database; for
+        // in-memory that is the shared handle, so this borrows through the same
+        // path the readers use.
+        let handle = self.read_conn();
+        handle.get().execute("DELETE FROM request_logs", [])?;
         Ok(())
     }
 
@@ -587,8 +703,8 @@ impl StatsDb {
     /// Return statistics for an arbitrary date (`YYYY-MM-DD`), aggregated from
     /// the request logs for that day.
     pub fn query_date(&self, date: &str) -> Result<DayStats> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let result = conn.query_row(
+        let handle = self.read_conn();
+        let result = handle.get().query_row(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 AND error IS NULL
@@ -965,6 +1081,102 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_readers_do_not_share_one_connection() {
+        // The point of the pool: the GUI polls the stats line and the request
+        // table every two seconds, and one shared lock made those queue behind
+        // each other. Two readers held at once must therefore use *different*
+        // connections.
+        let dir = std::env::temp_dir().join(format!("proxy-rs-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.db");
+        let db = StatsDb::open_at(&path).unwrap();
+
+        let a = db.read_conn();
+        let b = db.read_conn();
+        // Pointer identity is the assertion that matters: distinct connections,
+        // not merely two guards over the same one.
+        assert_ne!(
+            a.get() as *const Connection,
+            b.get() as *const Connection,
+            "concurrent readers must not serialize on one connection"
+        );
+
+        drop((a, b));
+
+        // Returned connections are kept for reuse. The pool settles at its
+        // high-water mark (2 here, because the second read found an empty pool
+        // and opened one) rather than growing with each query.
+        for _ in 0..10 {
+            let _ = db.read_conn();
+        }
+        assert_eq!(
+            db.readers.lock().unwrap().len(),
+            2,
+            "the pool must plateau, not grow per query"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pooled_read_sees_rows_written_by_the_writer_thread() {
+        // A pool is only useful if its connections observe the committed data:
+        // separate connections to the same file, not snapshots.
+        let dir = std::env::temp_dir().join(format!("proxy-rs-poolvis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.db");
+        let db = StatsDb::open_at(&path).unwrap();
+
+        db.record_request_log(outcome(
+            "hy3",
+            "/v1/messages",
+            &TokenRecord::default(),
+            200,
+            None,
+            true,
+        ))
+        .unwrap();
+
+        // Poll until the writer thread commits (it is asynchronous by design).
+        let mut seen = 0;
+        for _ in 0..200 {
+            seen = db.query_today().unwrap().requests_total;
+            if seen == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(seen, 1, "a pooled read must see the committed row");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_in_memory_database_shares_its_single_handle() {
+        // A second connection to `:memory:` would be a different, empty
+        // database, so in-memory mode must keep sharing one handle.
+        let db = StatsDb::in_memory().unwrap();
+        db.record_request_log(outcome(
+            "hy3",
+            "/v1/messages",
+            &TokenRecord::default(),
+            200,
+            None,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            db.query_today().unwrap().requests_total,
+            1,
+            "inline writes must be visible to reads"
+        );
+        assert!(
+            db.reader_source.is_none(),
+            "in-memory has no path to reopen"
+        );
+    }
+
+    #[test]
     fn writer_thread_persists_queued_rows() {
         // Persistent mode: record_request_log only queues, a background thread
         // commits. The queue must eventually land every row.
@@ -979,7 +1191,9 @@ mod tests {
         std::thread::spawn(move || writer_loop(write_conn, rx));
 
         let db = StatsDb {
-            conn: Arc::new(Mutex::new(read_conn)),
+            readers: Mutex::new(vec![read_conn]),
+            reader_source: Some(path.clone()),
+            conn: Arc::new(Mutex::new(StatsDb::connect(&path).unwrap())),
             queue: Some(tx),
         };
 
