@@ -1,19 +1,89 @@
 use crate::settings::{GuiSettings, DEFAULT_PORT};
 use anyhow::{bail, Result};
 use reqwest::Url;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Trimmed, non-empty environment variable, if set.
+/// Values parsed from the `.env` file, loaded once per process.
+///
+/// Deliberately *not* pushed into the process environment. `dotenvy::dotenv()`
+/// exists to call `std::env::set_var`, which is unsound to run while other
+/// threads read the environment — and `Config::from_settings` runs on a tokio
+/// worker on every proxy (re)start, i.e. on every settings save, while request
+/// handlers concurrently read env (`PROXY_TZ_OFFSET_HOURS`, the upstream keys).
+/// Parsing the file into a map keeps the documented `.env` behaviour without
+/// mutating shared process state.
+fn dotenv_values() -> &'static std::collections::HashMap<String, String> {
+    static VALUES: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    VALUES.get_or_init(load_dotenv_file)
+}
+
+/// Parse a `.env` file's contents into a map, first occurrence winning.
+///
+/// Split from [`load_dotenv_file`] so the parsing rules can be asserted without
+/// depending on which `.env` happens to exist on the machine.
+fn parse_dotenv(path: &std::path::Path) -> Option<std::collections::HashMap<String, String>> {
+    let iter = dotenvy::from_path_iter(path).ok()?;
+    Some(
+        iter.flatten()
+            .fold(std::collections::HashMap::new(), |mut acc, (k, v)| {
+                acc.entry(k).or_insert(v);
+                acc
+            }),
+    )
+}
+
+/// Read the first `.env` that exists, in the documented search order.
+///
+/// Uses `from_path_iter`, whose iterator only *parses* — the mutating
+/// `set_var` calls live in the separate `load`/`load_override` methods, which
+/// this never calls.
+fn load_dotenv_file() -> std::collections::HashMap<String, String> {
+    let mut candidates = vec![PathBuf::from(".env")];
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(&home).join(".proxy-rs").join(".env"));
+        candidates.push(PathBuf::from(home).join(".anthropic-proxy.env"));
+    }
+    candidates.push(PathBuf::from("/etc/anthropic-proxy/.env"));
+
+    candidates
+        .iter()
+        .find_map(|path| path.exists().then(|| parse_dotenv(path)).flatten())
+        .unwrap_or_default()
+}
+
+/// Look up a configuration value: the `.env` file first, then the real process
+/// environment.
+///
+/// `.env` wins because it is the more specific, project-local setting, and
+/// because it is the documented override for `gui-settings.json`. The process
+/// environment is still consulted, so a variable exported by the shell or set
+/// by launchd keeps working.
+///
+/// Scope: this covers the configuration keys `from_settings` reads. Readers
+/// outside this module that go straight to `std::env` — `PROXY_TZ_OFFSET_HOURS`,
+/// `CODEX_HOME` — now see only the real process environment. Previously a
+/// `.env` value reached them as a side effect of `set_var`, but only after the
+/// first proxy start had run `load_dotenv`, so it was never dependable; those
+/// are system-level settings and belong in the environment or a settings file.
+fn env_lookup(name: &str) -> Option<String> {
+    dotenv_values()
+        .get(name)
+        .cloned()
+        .or_else(|| std::env::var(name).ok())
+}
+
+/// Trimmed, non-empty configuration value, if set.
 fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+    env_lookup(name)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
 
-/// Truthy environment flag (`1` or `true`, case-insensitive).
+/// Truthy configuration flag (`1` or `true`, case-insensitive).
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
+    env_lookup(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -97,8 +167,6 @@ impl Config {
     /// from a configured shell (or an existing `.env` setup) keeps behaving as
     /// documented. This is the single construction path for the app.
     pub fn from_settings(settings: &GuiSettings) -> Result<Self> {
-        Self::load_dotenv();
-
         let chat_url = settings.chat_url(&crate::providers::builtin_presets());
         let upstream_urls = Self::parse_upstream_urls(&chat_url)?;
 
@@ -113,7 +181,7 @@ impl Config {
         // (`force_stream`), or the user turns it on per-provider in the GUI.
         // `ANTHROPIC_PROXY_FORCE_STREAM` still wins, so it remains overridable
         // for testing other providers without touching the settings file.
-        let force_stream_upstream = match std::env::var("ANTHROPIC_PROXY_FORCE_STREAM").ok() {
+        let force_stream_upstream = match env_lookup("ANTHROPIC_PROXY_FORCE_STREAM") {
             Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
             None => settings.force_stream(&crate::providers::builtin_presets()),
         };
@@ -165,26 +233,6 @@ impl Config {
 
         config.apply_env_overrides()?;
         Ok(config)
-    }
-
-    /// Load a `.env` file, first found wins. Mirrors the documented search
-    /// order: `./.env`, then the per-user data dir, then legacy locations.
-    fn load_dotenv() {
-        if dotenvy::dotenv().is_ok() {
-            return;
-        }
-        let mut candidates = Vec::new();
-        if let Ok(home) = std::env::var("HOME") {
-            candidates.push(PathBuf::from(&home).join(".proxy-rs").join(".env"));
-            candidates.push(PathBuf::from(home).join(".anthropic-proxy.env"));
-        }
-        candidates.push(PathBuf::from("/etc/anthropic-proxy/.env"));
-
-        for path in candidates {
-            if path.exists() && dotenvy::from_path(&path).is_ok() {
-                return;
-            }
-        }
     }
 
     /// Apply the documented environment variables on top of the settings.
@@ -420,7 +468,63 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::*;
+
+    /// Write `contents` to a uniquely-named temp file for a test.
+    fn temp_env(name: &str, contents: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("proxy-rs-env-{}-{}", std::process::id(), name));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn dotenv_values_are_parsed_without_touching_the_process_environment() {
+        // The point of the parser: `dotenvy::dotenv()` would `set_var` these,
+        // which is unsound while request handlers read the environment.
+        let path = temp_env(
+            "parse",
+            "UPSTREAM_BASE_URL=https://example.test\nVERBOSE=1\n",
+        );
+        let vars = parse_dotenv(&path).expect("parses");
+        assert_eq!(vars["UPSTREAM_BASE_URL"], "https://example.test");
+        assert_eq!(vars["VERBOSE"], "1");
+
+        assert!(
+            std::env::var("UPSTREAM_BASE_URL").is_err(),
+            "parsing must not leak into the process environment"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_repeated_key_keeps_its_first_value() {
+        // Matches dotenv semantics: the first occurrence wins.
+        let path = temp_env("dupe", "K=first\nK=second\n");
+        let vars = parse_dotenv(&path).expect("parses");
+        assert_eq!(vars["K"], "first");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn comments_and_quotes_are_handled_by_the_parser() {
+        let path = temp_env(
+            "quotes",
+            "# a comment\nQUOTED=\"has spaces\"\nPLAIN=bare\nexport EXPORTED=yes\n",
+        );
+        let vars = parse_dotenv(&path).expect("parses");
+        assert_eq!(vars["QUOTED"], "has spaces");
+        assert_eq!(vars["PLAIN"], "bare");
+        assert_eq!(vars["EXPORTED"], "yes");
+        assert!(!vars.contains_key("# a comment"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_missing_file_is_empty_rather_than_an_error() {
+        let missing = std::env::temp_dir().join("proxy-rs-env-does-not-exist");
+        assert!(parse_dotenv(&missing).is_none());
+    }
 
     #[test]
     fn base_url_without_version_defaults_to_v1_endpoint() {

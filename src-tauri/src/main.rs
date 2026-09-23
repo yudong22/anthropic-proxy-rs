@@ -100,7 +100,14 @@ async fn get_status(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
 
 #[tauri::command]
 async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
-    let today = ctx.stats.query_today().map_err(|e| e.to_string())?;
+    // SQLite access is blocking; run it off the async runtime so a slow query
+    // (or a writer holding the connection) cannot park a worker thread. The UI
+    // polls this every couple of seconds.
+    let stats = ctx.stats.clone();
+    let today = tauri::async_runtime::spawn_blocking(move || stats.query_today())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     Ok(json!({
         "date": today.date,
         "requests_total": today.requests_total,
@@ -177,16 +184,23 @@ async fn get_request_logs(
     ctx: State<'_, Arc<AppContext>>,
 ) -> Result<Value, String> {
     let f = filter.unwrap_or_default();
-    let res = ctx
-        .stats
-        .query_request_logs(&f)
+    // Blocking SQLite off the async runtime: this runs several queries under a
+    // std Mutex, on a command the UI polls every 2 seconds.
+    let stats = ctx.stats.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || stats.query_request_logs(&f))
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     serde_json::to_value(&res).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn clear_request_logs(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
-    ctx.stats.clear_request_logs().map_err(|e| e.to_string())?;
+    let stats = ctx.stats.clone();
+    tauri::async_runtime::spawn_blocking(move || stats.clear_request_logs())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true }))
 }
 
