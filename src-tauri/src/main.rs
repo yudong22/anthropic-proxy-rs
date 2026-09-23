@@ -351,7 +351,16 @@ async fn apply_claude_config(
     body: ClaudeConfigBody,
     ctx: State<'_, Arc<AppContext>>,
 ) -> Result<Value, String> {
-    let port = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
+    // Prefer the port actually bound, but fall back to the configured one: a
+    // stopped service reports port 0, and writing `http://127.0.0.1:0` would
+    // point Claude Code at nothing. The configured port is where the service
+    // will bind when it next starts.
+    let bound = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
+    let port = if bound != 0 {
+        bound
+    } else {
+        ctx.settings.read().await.port
+    };
     let base_url = format!("http://127.0.0.1:{}", port);
 
     let mut updates = Vec::new();
