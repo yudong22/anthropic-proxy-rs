@@ -1447,6 +1447,54 @@ fn serialize_sse_event<T: serde::Serialize>(event_type: &str, event: &T) -> Stri
     )
 }
 
+/// Owns the one request-log row for a streamed request, and writes it when the
+/// stream generator is dropped.
+///
+/// Recording on drop rather than after the final `yield` is what makes the row
+/// independent of how much of the response the client chose to read: a `yield`
+/// suspends the generator, so a client that disconnects (or simply stops
+/// reading) at that point drops the generator before any later statement runs.
+/// Drop always runs, so the request still reaches the log — with whatever
+/// tokens and error state had been observed by then, and a duration measured
+/// from the start of the request.
+struct StreamLedger {
+    model: String,
+    route: &'static str,
+    start: Instant,
+    stats: Arc<StatsDb>,
+    tokens: TokenRecord,
+    /// Set when the upstream stream failed; turns the row's status into a 500.
+    error: Option<String>,
+}
+
+impl StreamLedger {
+    fn new(model: String, route: &'static str, start: Instant, stats: Arc<StatsDb>) -> Self {
+        Self {
+            model,
+            route,
+            start,
+            stats,
+            tokens: TokenRecord::default(),
+            error: None,
+        }
+    }
+}
+
+impl Drop for StreamLedger {
+    fn drop(&mut self) {
+        let status = if self.error.is_some() { 500 } else { 200 };
+        let _ = self.stats.record_request_log(RequestOutcome {
+            model: &self.model,
+            route: self.route,
+            tokens: &self.tokens,
+            duration_ms: self.start.elapsed().as_millis() as i64,
+            streamed: true,
+            status,
+            error: self.error.as_deref(),
+        });
+    }
+}
+
 /// Shared SSE framer for all three API flavors.
 ///
 /// All three read the upstream's OpenAI-style `data: {...}` stream and differ
@@ -1464,10 +1512,20 @@ fn create_flavor_sse_stream(
     stats: Arc<StatsDb>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        // Records the request row when the stream ends — including when the
+        // client drops the body early.
+        //
+        // A client is free to stop reading the moment it sees what it needs: a
+        // Responses client stops at `response.completed` and never reads the
+        // trailing `data: [DONE]`, which only exists for SDKs that read until
+        // the stream closes. Since every `yield` suspends the generator, a
+        // client that stops mid-stream drops it *at* that yield, and no code
+        // after the last yield would ever run. Holding the recording in a guard
+        // tied to this generator's lifetime makes the row independent of how
+        // far the client read.
+        let mut ledger = StreamLedger::new(client_model.clone(), route, start, stats.clone());
         let mut buffer = String::new();
-        let mut tokens = TokenRecord::default();
         let mut usage_captured = false;
-        let mut stream_error: Option<String> = None;
 
         // Only the Anthropic and Responses APIs need translation state.
         let mut anthropic_state = match flavor {
@@ -1479,9 +1537,8 @@ fn create_flavor_sse_stream(
             _ => None,
         };
 
-        // Record usage exactly once per stream, when the stream ends. Capturing
-        // a usage chunk only stores the token numbers — the DB row is written
-        // once, after the response has been fully delivered.
+        // Record usage exactly once per stream, when the first usage chunk
+        // arrives. The ledger holds it until the request is recorded.
         macro_rules! capture_usage {
             ($usage:expr) => {
                 if !usage_captured {
@@ -1489,7 +1546,7 @@ fn create_flavor_sse_stream(
                     if flavor == ApiFlavor::Chat {
                         metrics::tokens(usage.prompt_tokens, usage.completion_tokens, &client_model);
                     }
-                    tokens = usage.to_token_record();
+                    ledger.tokens = usage.to_token_record();
                     usage_captured = true;
                 }
             };
@@ -1620,7 +1677,7 @@ fn create_flavor_sse_stream(
                     }
                 }
                 Err(e) => {
-                    stream_error = Some(format!("{}", e));
+                    ledger.error = Some(format!("{}", e));
                     match flavor {
                         ApiFlavor::Anthropic => {
                             tracing::error!("Stream error: {}", e);
@@ -1650,26 +1707,10 @@ fn create_flavor_sse_stream(
             }
         }
 
-        // Exactly one DB write per request, now that the stream has finished.
-        // Streaming previously wrote as soon as a usage chunk appeared, which
-        // both hit SQLite per chunk and left a row behind if the stream then
-        // failed.
-        {
-            let duration_ms = start.elapsed().as_millis() as i64;
-            let status = if stream_error.is_some() { 500 } else { 200 };
-            let _ = stats.record_request_log(RequestOutcome {
-                model: &client_model,
-                route,
-                tokens: &tokens,
-                duration_ms,
-                streamed: true,
-                status,
-                error: stream_error.as_deref(),
-            });
-        }
-
         // The Responses API stream must always terminate with a completed
         // response and `[DONE]`, even when the upstream omitted the terminator.
+        // The request row is already recorded: the ledger below fires when this
+        // generator is dropped, whether that happens here or mid-stream.
         if flavor == ApiFlavor::Responses {
             if let Some(state) = responses_state.as_mut() {
                 for event in responses_pipeline::translate_stream_done(state) {
@@ -2327,6 +2368,56 @@ mod tests {
         assert!(raw.contains("event: response.output_text.delta"));
         assert!(raw.contains("event: response.completed"));
         assert!(raw.contains("data: [DONE]"));
+    }
+
+    /// A Responses client stops reading as soon as the terminal
+    /// `response.completed` event arrives — it has no reason to wait for the
+    /// trailing `data: [DONE]` sentinel, which only exists for SDKs that read
+    /// until the stream closes.
+    ///
+    /// The recording block sits *after* the last `yield`, so dropping the
+    /// response body at that point skips it and the request never reaches the
+    /// request log. This is the regression: `/v1/responses` traffic that
+    /// succeeds but writes no row.
+    #[tokio::test]
+    async fn responses_client_stopping_at_completed_still_logs_the_request() {
+        let chunks = vec![
+            openai_chunk("chatcmpl-resp", "gpt-4o", Some("Hello"), None),
+            openai_chunk("chatcmpl-resp", "gpt-4o", None, Some("stop")),
+            openai_done(),
+        ];
+        let s = make_stream(chunks);
+        let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
+        let stats = mock_stats();
+        let sse = super::create_responses_sse_stream(s, "gpt-4o".to_string(), logs, stats.clone());
+        // Box it, as `Body::from_stream` does for the real response: the guard
+        // has to fire when the *body* is dropped, not when the local is.
+        let mut sse = Box::pin(sse);
+
+        // Read only up to and including the `response.completed` event, then
+        // drop the body — exactly what an SDK doing
+        // `stream.until_completed()` leaves behind.
+        let mut raw = String::new();
+        while let Some(item) = sse.next().await {
+            raw.push_str(&String::from_utf8_lossy(&item.unwrap()));
+            if raw.contains("event: response.completed") {
+                break;
+            }
+        }
+        drop(sse);
+
+        let rows = stats
+            .query_request_logs(&crate::stats::RequestLogFilter::default())
+            .unwrap()
+            .items;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a completed /v1/responses stream must leave exactly one log row, found {}",
+            rows.len()
+        );
+        assert_eq!(rows[0].route, "/v1/responses");
+        assert_eq!(rows[0].status, 200);
     }
 
     /// Upstreams such as WorkBuddy send `"finish_reason": ""` on every chunk.
