@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
 /// One log entry in the in-memory ring buffer.
@@ -74,8 +76,27 @@ impl LogBuffer {
 
     pub async fn clear(&self) {
         self.entries.write().await.clear();
-        if let Some(path) = log_file_path() {
-            let _ = std::fs::write(&path, "");
+        // Truncate through the writer thread rather than writing the file
+        // directly. A direct truncate races the queue: lines already sent but
+        // not yet flushed land *after* the truncate and the log refills itself,
+        // which is why "清空" appeared to do nothing. Queueing a truncate keeps
+        // it ordered after everything already queued, and drops the writer's
+        // handle so it reopens against the emptied file.
+        //
+        // The wait runs on a blocking thread: `recv_timeout` must not park a
+        // runtime worker, and correctness does not depend on the ack anyway
+        // (the truncate is ordered regardless of who waits for it).
+        let (tx, rx) = channel::<()>();
+        if log_writer()
+            .send(LogInstruction::Truncate(Box::new(move || {
+                let _ = tx.send(());
+            })))
+            .is_ok()
+        {
+            let _ = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+            })
+            .await;
         }
     }
 }
@@ -171,43 +192,154 @@ pub fn log_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Serializes log writes so concurrent request handlers cannot interleave
-/// half-written lines.
+/// One item for the log writer: a line to append, or a barrier to run once
+/// everything queued before it has been written.
+enum LogInstruction {
+    Line(String),
+    /// Empty the file, ordered after every line queued so far. The callback runs
+    /// once the truncate has happened, so a caller can wait for it.
+    Truncate(Box<dyn FnOnce() + Send>),
+    /// Test-only: see [`flush_log_writer`]. Never constructed in production, so
+    /// the variant is gated to keep the lib build free of dead-code warnings.
+    #[cfg(test)]
+    Flush(Box<dyn FnOnce() + Send>),
+}
+
+/// Single writer for the log file.
 ///
-/// `writeln!` issues one `write` syscall per format fragment, so without an
-/// exclusive handle two tasks interleave half-written lines — exactly the torn
-/// output this guards against. The lock is held across the whole line (body +
-/// newline) so no other writer can split it.
-static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+/// Mirrors the stats writer deliberately: one owner thread drains a queue, so
+/// every line has exactly one writer and nothing has to coordinate a lock.
+/// Callers only `send`, which never blocks on disk I/O — the previous design
+/// had every request handler lock a mutex, write and flush inline, putting
+/// synchronous file I/O on the async request path.
+fn log_writer() -> &'static Sender<LogInstruction> {
+    static WRITER: OnceLock<Sender<LogInstruction>> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = channel::<LogInstruction>();
+        std::thread::Builder::new()
+            .name("log-writer".to_string())
+            .spawn(move || writer_loop_log(rx))
+            .expect("failed to spawn log writer thread");
+        tx
+    })
+}
+
+/// Drain the queue, appending lines and acting on barriers in order.
+fn writer_loop_log(rx: Receiver<LogInstruction>) {
+    let mut file: Option<(PathBuf, std::fs::File)> = None;
+
+    while let Ok(first) = rx.recv() {
+        // Coalesce a run of lines into one write, so a burst of requests costs
+        // one syscall batch instead of one per line. A barrier ends the run, so
+        // it observes everything queued before it.
+        let mut batch = String::new();
+        let mut pending = Some(first);
+
+        // The instruction that stopped the run, if any: either an explicit
+        // barrier or a truncate. `None` means the queue simply ran dry.
+        let stop: Option<LogInstruction> = loop {
+            match pending.take() {
+                Some(LogInstruction::Line(line)) => {
+                    if !batch.is_empty() {
+                        batch.push('\n');
+                    }
+                    batch.push_str(&line);
+                }
+                Some(other) => break Some(other),
+                None => match rx.try_recv() {
+                    Ok(next) => pending = Some(next),
+                    Err(_) => break None,
+                },
+            }
+        };
+
+        if !batch.is_empty() {
+            batch.push('\n');
+            write_batch(&mut file, &batch);
+        }
+
+        match stop {
+            Some(LogInstruction::Truncate(done)) => {
+                truncate_file(&mut file);
+                done();
+            }
+            #[cfg(test)]
+            Some(LogInstruction::Flush(done)) => done(),
+            // `Line` can only be consumed by the loop above, and `None` is the
+            // queue running dry.
+            Some(LogInstruction::Line(_)) | None => {}
+        }
+    }
+}
+
+/// Empty the log file and drop the cached handle so the next append reopens it.
+///
+/// Writing the file directly from the caller instead would race the queue: a
+/// line already sent but not yet flushed would land after the truncate and the
+/// log would refill itself.
+fn truncate_file(file: &mut Option<(PathBuf, std::fs::File)>) {
+    if let Some((path, _)) = file.take() {
+        let _ = std::fs::write(path, "");
+    } else if let Some(path) = log_file_path() {
+        let _ = std::fs::write(path, "");
+    }
+}
+
+/// Append one coalesced batch, reopening the handle if the path changed.
+fn write_batch(file: &mut Option<(PathBuf, std::fs::File)>, batch: &str) {
+    use std::io::Write;
+    let Some(path) = log_file_path() else {
+        return;
+    };
+    // Reopen only when the target actually changed. In production it never
+    // does; under test the override moves between cases, and a stale handle
+    // would silently keep writing to the previous test's file.
+    if file.as_ref().map(|(p, _)| p != &path).unwrap_or(true) {
+        *file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+            .map(|f| (path, f));
+    }
+    if let Some((_, f)) = file.as_mut() {
+        // One write call per batch: this thread is the only writer, so no other
+        // line can land in the middle of one.
+        let _ = f.write_all(batch.as_bytes());
+        // Flush per batch so a crash does not lose recent history.
+        let _ = f.flush();
+    }
+}
+
+fn append_log_line(line: &str) {
+    // A dead writer must never fail a request; the in-memory buffer and the GUI
+    // view do not depend on this mirror.
+    let _ = log_writer().send(LogInstruction::Line(line.to_string()));
+}
+
+/// Block until every line queued so far has been written and flushed.
+///
+/// Production code never needs this — the buffer is the live view and the file
+/// is a mirror. Tests do: appending is asynchronous, so asserting on file
+/// contents right after a push is a race that passes only when the writer
+/// thread happens to keep up. This is the deterministic counterpart to the poll
+/// loop the stats tests use.
+#[cfg(test)]
+fn flush_log_writer() {
+    let (tx, rx) = channel::<()>();
+    if log_writer()
+        .send(LogInstruction::Flush(Box::new(move || {
+            let _ = tx.send(());
+        })))
+        .is_ok()
+    {
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+    }
+}
 
 /// Test hook: forces log mirroring to a temp file instead of the user's
 /// `~/.proxy-rs/logs/proxy.log`. Re-settable so two tests can each redirect it.
 static LOG_FILE_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-fn append_log_line(line: &str) {
-    let Some(path) = log_file_path() else {
-        return;
-    };
-    let mut guard = match LOG_FILE.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if guard.is_none() {
-        *guard = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .ok();
-    }
-    if let Some(file) = guard.as_mut() {
-        use std::io::Write;
-        // Body and newline are written while holding the lock, so no other
-        // writer can land between them and tear the line.
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.write_all(b"\n");
-        let _ = file.flush();
-    }
-}
 
 /// Rolling log file: `~/.proxy-rs/logs/proxy.log`.
 pub fn log_file_path() -> Option<PathBuf> {
@@ -219,13 +351,12 @@ pub fn log_file_path() -> Option<PathBuf> {
     Some(log_dir()?.join("proxy.log"))
 }
 
-/// Point log mirroring at `path` for the rest of the process (tests only).
+/// Point log mirroring at `path` (tests only).
+///
+/// Only effective while no line has been written yet: the writer thread opens
+/// its handle once and keeps it, so a later redirect cannot move an open file.
 #[cfg(test)]
 fn set_log_file_override(path: PathBuf) {
-    // Drop any handle pointing at the previous location.
-    if let Ok(mut g) = LOG_FILE.lock() {
-        *g = None;
-    }
     if let Ok(mut g) = LOG_FILE_OVERRIDE.lock() {
         *g = Some(path);
     }
@@ -407,6 +538,11 @@ mod tests {
             }
         });
 
+        // Appending is asynchronous, so wait for the queue to drain before
+        // reading; otherwise this is a race that only passes when the writer
+        // thread keeps up.
+        flush_log_writer();
+
         // The real regression was on disk: every written line must carry
         // exactly one "[INFO] " marker and end with this test's body. A torn
         // line splices two writes together and therefore shows two markers.
@@ -421,6 +557,44 @@ mod tests {
             );
             assert!(line.ends_with(END_MARKER), "truncated log line: {line:?}");
         }
+    }
+
+    #[test]
+    fn clear_empties_the_log_file_for_real() {
+        // Regression: `clear` used to truncate the file directly while the
+        // writer thread still had lines queued. Those landed after the
+        // truncate, the file refilled, and "清空" looked like it did nothing.
+        let (log_path, _guard) = use_temp_log_file("clear.log");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let buf = LogBuffer::new(500);
+            for i in 0..30 {
+                buf.push("INFO", format!("before clear {i}")).await;
+            }
+
+            // Clear immediately, with writes still in flight.
+            buf.clear().await;
+
+            assert!(buf.snapshot().await.is_empty(), "buffer must be emptied");
+
+            // Anything queued after the clear must survive; anything queued
+            // before it must not.
+            for i in 0..5 {
+                buf.push("INFO", format!("after clear {i}")).await;
+            }
+        });
+        flush_log_writer();
+
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !text.contains("before clear"),
+            "pre-clear lines came back: {text}"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.contains("after clear")).count(),
+            5,
+            "post-clear lines must still be written: {text}"
+        );
     }
 
     #[test]

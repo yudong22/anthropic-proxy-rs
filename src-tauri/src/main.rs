@@ -535,6 +535,20 @@ fn focus_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Quit for real, surviving launch-at-login.
+///
+/// The LaunchAgent plist sets `KeepAlive`, so launchd restarts the process the
+/// moment it exits. Calling `app.exit(0)` on its own therefore looks like a
+/// crash and the app reappears immediately — from the user's side, "退出" does
+/// nothing. Booting the job out first removes the reason to relaunch, and the
+/// plist stays on disk so the next login still auto-starts the app.
+fn quit_app(app: &tauri::AppHandle) {
+    if let Err(e) = launch_agent::suspend() {
+        eprintln!("Warning: could not suspend launch-at-login before quitting: {e}");
+    }
+    app.exit(0);
+}
+
 /// Show the log directory in the OS file manager.
 #[tauri::command]
 fn open_logs_dir() {
@@ -709,6 +723,14 @@ fn main() {
     let settings = GuiSettings::load();
     let service_ctrl = service::ServiceController::new(settings.port, true);
 
+    // Re-arm launch-at-login. A user-initiated quit boots the job out (so the
+    // exit is not undone by `KeepAlive`) while leaving the plist on disk, which
+    // means the login item is only registered again from here. Without this the
+    // setting would still read as enabled but never actually fire.
+    if settings.launch_at_login {
+        let _ = launch_agent::install();
+    }
+
     // Install the global metrics recorder once, up front. Doing it here (rather
     // than inside the server task) makes any failure visible at startup instead
     // of silently aborting the first proxy (re)start.
@@ -743,13 +765,22 @@ fn main() {
     let ctx_for_setup = ctx.clone();
     let ctx_for_tray = ctx.clone();
 
-    tauri::Builder::default()
+    // A launchd-managed instance must not be treated as a duplicate launch.
+    // The single-instance plugin kills the newer process on a second launch, and
+    // because the plist sets `KeepAlive`, launchd would immediately start it
+    // again — an endless start/kill loop whenever the login item and a manually
+    // opened copy overlap. The flag is what tells the two apart.
+    let is_launchd_child = launch_agent::running_as_launchd_child(std::env::args());
+
+    let mut builder = tauri::Builder::default();
+
+    if !is_launchd_child {
         // Registered first, as the plugin requires: on a second launch this
         // process is killed immediately and the callback runs in the original
         // instance, which reveals its window. That keeps the proxy bound to the
         // one port the client CLIs are configured against instead of leaving a
         // second, portless copy in the Dock.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             focus_main_window(app);
             let ctx = app.state::<Arc<AppContext>>().inner().clone();
             // A second launch means "I could not find the window": if the
@@ -763,7 +794,10 @@ fn main() {
                     .push("INFO", "重复启动已合并到当前实例".to_string())
                     .await;
             });
-        }))
+        }));
+    }
+
+    builder
         .manage(ctx)
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -812,9 +846,7 @@ fn main() {
                     }
                     "start" => request_start(app.clone(), tray_ctx.clone()),
                     "stop" => request_stop(app.clone(), tray_ctx.clone()),
-                    "quit" => {
-                        app.exit(0);
-                    }
+                    "quit" => quit_app(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
