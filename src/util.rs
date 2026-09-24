@@ -133,7 +133,8 @@ fn redact_header_value(name: &str, value: &str) -> String {
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Environment override for [`DEFAULT_MAX_BODY_BYTES`], in bytes.
-pub const MAX_BODY_ENV: &str = "ANTHROPIC_PROXY_MAX_BODY_BYTES";
+pub const MAX_BODY_ENV: &str = "PROXY_MAX_BODY_BYTES";
+pub const LEGACY_MAX_BODY_ENV: &str = "ANTHROPIC_PROXY_MAX_BODY_BYTES";
 
 /// The configured body cap, read from the environment on each call.
 ///
@@ -141,6 +142,7 @@ pub const MAX_BODY_ENV: &str = "ANTHROPIC_PROXY_MAX_BODY_BYTES";
 /// disabling the limit: an unparseable override must not become "unlimited".
 pub fn max_body_bytes() -> usize {
     std::env::var(MAX_BODY_ENV)
+        .or_else(|_| std::env::var(LEGACY_MAX_BODY_ENV))
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -550,6 +552,7 @@ mod tests {
     #[test]
     fn max_body_bytes_falls_back_on_bad_overrides() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(LEGACY_MAX_BODY_ENV);
 
         for bad in ["", "  ", "0", "not-a-number", "-1"] {
             std::env::set_var(MAX_BODY_ENV, bad);
@@ -565,6 +568,11 @@ mod tests {
 
         std::env::remove_var(MAX_BODY_ENV);
         assert_eq!(max_body_bytes(), DEFAULT_MAX_BODY_BYTES);
+
+        // Legacy variable also works when new one is unset
+        std::env::set_var(LEGACY_MAX_BODY_ENV, "131072");
+        assert_eq!(max_body_bytes(), 131072);
+        std::env::remove_var(LEGACY_MAX_BODY_ENV);
     }
 
     #[tokio::test]

@@ -186,11 +186,14 @@ pub fn data_dir() -> Option<PathBuf> {
 
 /// Override the data directory, for a second instance that must not share
 /// state with the installed app. `task dev` points this at `~/.proxy-rs-dev`.
-const DATA_DIR_ENV: &str = "ANTHROPIC_PROXY_DATA_DIR";
+const DATA_DIR_ENV: &str = "PROXY_DATA_DIR";
+const LEGACY_DATA_DIR_ENV: &str = "ANTHROPIC_PROXY_DATA_DIR";
 
 /// The [`DATA_DIR_ENV`] override, `~` expanded. `None` when unset or blank.
 fn env_data_dir() -> Option<PathBuf> {
-    let raw = std::env::var(DATA_DIR_ENV).ok()?;
+    let raw = std::env::var(DATA_DIR_ENV)
+        .or_else(|_| std::env::var(LEGACY_DATA_DIR_ENV))
+        .ok()?;
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -557,7 +560,7 @@ mod tests {
     /// not run concurrently with each other.
     static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Run `body` with `ANTHROPIC_PROXY_DATA_DIR` set to `value`, then restore
+    /// Run `body` with `PROXY_DATA_DIR` set to `value`, then restore
     /// whatever was there. Returns the guard so the caller keeps exclusivity.
     ///
     /// Env vars are process-wide, so a leaked value would change what every
@@ -566,21 +569,27 @@ mod tests {
         value: Option<&str>,
     ) -> (
         std::sync::MutexGuard<'static, ()>,
-        Option<std::ffi::OsString>,
+        (Option<std::ffi::OsString>, Option<std::ffi::OsString>),
     ) {
         let guard = DATA_DIR_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let previous = std::env::var_os(DATA_DIR_ENV);
+        let legacy_previous = std::env::var_os(LEGACY_DATA_DIR_ENV);
+        std::env::remove_var(LEGACY_DATA_DIR_ENV);
         match value {
             Some(v) => std::env::set_var(DATA_DIR_ENV, v),
             None => std::env::remove_var(DATA_DIR_ENV),
         }
-        (guard, previous)
+        (guard, (previous, legacy_previous))
     }
 
-    fn restore_data_dir_env(previous: Option<std::ffi::OsString>) {
-        match previous {
+    fn restore_data_dir_env(previous: (Option<std::ffi::OsString>, Option<std::ffi::OsString>)) {
+        match previous.0 {
             Some(v) => std::env::set_var(DATA_DIR_ENV, v),
             None => std::env::remove_var(DATA_DIR_ENV),
+        }
+        match previous.1 {
+            Some(v) => std::env::set_var(LEGACY_DATA_DIR_ENV, v),
+            None => std::env::remove_var(LEGACY_DATA_DIR_ENV),
         }
     }
 

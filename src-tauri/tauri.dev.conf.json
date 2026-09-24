@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "identifier": "com.anthropic-proxy.desktop.dev",
-  "productName": "Anthropic Proxy (Dev)",
+  "identifier": "com.proxy-rs.desktop.dev",
+  "productName": "Proxy RS (Dev)",
   "app": {
     "windows": [
       {
-        "title": "Anthropic Proxy (Dev)",
+        "title": "Proxy RS (Dev)",
         "label": "main",
         "width": 920,
         "height": 660,

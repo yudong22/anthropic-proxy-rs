@@ -1,6 +1,6 @@
 # Claude Code 与上游网关拦截排查指南 (Code 11128)
 
-本文档记录了在使用 Claude Code 通过本代理（`anthropic-proxy-rs`）接入 WorkBuddy / 腾讯 Copilot 等上游服务商时，遇到上游错误码 `11128`（`Illegal API invocation from an unapproved channel` / `请求被安全策略拦截`）的根因排查过程、请求头分析及应对方案。
+本文档记录了在使用 Claude Code 通过本代理（`proxy-rs`）接入 WorkBuddy / 腾讯 Copilot 等上游服务商时，遇到上游错误码 `11128`（`Illegal API invocation from an unapproved channel` / `请求被安全策略拦截`）的根因排查过程、请求头分析及应对方案。
 
 ---
 

@@ -1,8 +1,8 @@
 [package]
-name = "anthropic-proxy-gui"
-version = "1.6.0"
+name = "proxy-rs-gui"
+version = "1.7.0"
 edition = "2021"
-description = "Anthropic Proxy Desktop GUI"
+description = "Proxy RS Desktop GUI"
 
 [dependencies]
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.7", features = ["http2"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 anyhow = "1.0"
-anthropic-proxy = { path = ".." }
+proxy-rs = { path = ".." }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -13,17 +13,17 @@
 //! tests would write their synthetic credentials into the developer's real,
 //! long-lived `~/.proxy-rs/logs/proxy.log`.
 
-use anthropic_proxy::{
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use proxy_rs::{
     config::Config,
     metrics,
     router::build_app_router,
     service::ServiceController,
     settings::{self, LogBuffer},
     stats::StatsDb,
-};
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;

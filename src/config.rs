@@ -43,8 +43,10 @@ fn load_dotenv_file() -> std::collections::HashMap<String, String> {
     let mut candidates = vec![PathBuf::from(".env")];
     if let Ok(home) = std::env::var("HOME") {
         candidates.push(PathBuf::from(&home).join(".proxy-rs").join(".env"));
+        candidates.push(PathBuf::from(&home).join(".proxy-rs.env"));
         candidates.push(PathBuf::from(home).join(".anthropic-proxy.env"));
     }
+    candidates.push(PathBuf::from("/etc/proxy-rs/.env"));
     candidates.push(PathBuf::from("/etc/anthropic-proxy/.env"));
 
     candidates
@@ -179,9 +181,11 @@ impl Config {
         let sanitize_fingerprints = models_flavor == ModelsFlavor::WorkBuddyConfig;
         // Providers that only serve streaming bodies declare it in their preset
         // (`force_stream`), or the user turns it on per-provider in the GUI.
-        // `ANTHROPIC_PROXY_FORCE_STREAM` still wins, so it remains overridable
+        // `PROXY_FORCE_STREAM` / `ANTHROPIC_PROXY_FORCE_STREAM` still wins, so it remains overridable
         // for testing other providers without touching the settings file.
-        let force_stream_upstream = match env_lookup("ANTHROPIC_PROXY_FORCE_STREAM") {
+        let force_stream_upstream = match env_lookup("PROXY_FORCE_STREAM")
+            .or_else(|| env_lookup("ANTHROPIC_PROXY_FORCE_STREAM"))
+        {
             Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
             None => settings.force_stream(&crate::providers::builtin_presets()),
         };
@@ -191,7 +195,9 @@ impl Config {
         } else {
             Self::parse_model_map(&settings.model_map)?
         };
-        if let Some(raw_map) = non_empty_env("ANTHROPIC_PROXY_MODEL_MAP") {
+        if let Some(raw_map) =
+            non_empty_env("PROXY_MODEL_MAP").or_else(|| non_empty_env("ANTHROPIC_PROXY_MODEL_MAP"))
+        {
             model_map.extend(Self::parse_model_map(&raw_map)?);
         }
 
@@ -201,13 +207,15 @@ impl Config {
             } else {
                 settings.port
             }),
-            bind: non_empty_env("ANTHROPIC_PROXY_BIND").unwrap_or_else(|| {
-                if settings.bind.trim().is_empty() {
-                    "127.0.0.1".to_string()
-                } else {
-                    settings.bind.trim().to_string()
-                }
-            }),
+            bind: non_empty_env("PROXY_BIND")
+                .or_else(|| non_empty_env("ANTHROPIC_PROXY_BIND"))
+                .unwrap_or_else(|| {
+                    if settings.bind.trim().is_empty() {
+                        "127.0.0.1".to_string()
+                    } else {
+                        settings.bind.trim().to_string()
+                    }
+                }),
             upstream_urls,
             api_key: Some(settings.api_key.trim().to_string()).filter(|k| !k.is_empty()),
             reasoning_model: Some(settings.reasoning_model.trim().to_string())
@@ -237,8 +245,9 @@ impl Config {
 
     /// Apply the documented environment variables on top of the settings.
     fn apply_env_overrides(&mut self) -> Result<()> {
-        if let Some(raw_urls) =
-            non_empty_env("UPSTREAM_BASE_URL").or_else(|| non_empty_env("ANTHROPIC_PROXY_BASE_URL"))
+        if let Some(raw_urls) = non_empty_env("UPSTREAM_BASE_URL")
+            .or_else(|| non_empty_env("PROXY_BASE_URL"))
+            .or_else(|| non_empty_env("ANTHROPIC_PROXY_BASE_URL"))
         {
             self.upstream_urls = Self::parse_upstream_urls(&raw_urls)?;
         }
@@ -258,7 +267,9 @@ impl Config {
             self.credits_endpoint = Some(endpoint);
         }
 
-        if let Some(terms) = non_empty_env("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS") {
+        if let Some(terms) = non_empty_env("PROXY_SYSTEM_PROMPT_IGNORE_TERMS")
+            .or_else(|| non_empty_env("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS"))
+        {
             self.system_prompt_ignore_terms = Self::parse_system_prompt_ignore_terms(&terms);
             Self::dedupe_ignore_terms(&mut self.system_prompt_ignore_terms);
         }
@@ -444,7 +455,7 @@ impl Config {
         {
             let (source, target) = entry.split_once('=').ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid ANTHROPIC_PROXY_MODEL_MAP entry '{}'. Expected source=target",
+                    "Invalid model map entry '{}'. Expected source=target",
                     entry
                 )
             })?;
@@ -454,7 +465,7 @@ impl Config {
 
             if source.is_empty() || target.is_empty() {
                 bail!(
-                    "Invalid ANTHROPIC_PROXY_MODEL_MAP entry '{}'. Source and target models must be non-empty",
+                    "Invalid model map entry '{}'. Source and target models must be non-empty",
                     entry
                 );
             }

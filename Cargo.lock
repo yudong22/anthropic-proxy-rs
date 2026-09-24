@@ -54,51 +54,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anthropic-proxy"
-version = "1.6.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "axum",
- "bytes",
- "dotenvy",
- "futures",
- "libc",
- "metrics",
- "metrics-exporter-prometheus",
- "regex",
- "reqwest 0.12.24",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "anthropic-proxy-gui"
-version = "1.6.0"
-dependencies = [
- "anthropic-proxy",
- "anyhow",
- "axum",
- "reqwest 0.12.24",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-single-instance",
- "tokio",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3047,6 +3002,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proxy-rs"
+version = "1.7.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "bytes",
+ "dotenvy",
+ "futures",
+ "libc",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "regex",
+ "reqwest 0.12.24",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "proxy-rs-gui"
+version = "1.7.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "proxy-rs",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-single-instance",
+ "tokio",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

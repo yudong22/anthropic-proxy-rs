@@ -16,7 +16,13 @@
 //!   * both the 413 and a failed read leave a trace in the log buffer and the
 //!     stats DB, so the failure is visible instead of silent.
 
-use anthropic_proxy::{
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use bytes::Bytes;
+use futures::stream;
+use proxy_rs::{
     config::Config,
     metrics,
     router::build_app_router,
@@ -25,12 +31,6 @@ use anthropic_proxy::{
     stats::{RequestLogFilter, StatsDb},
     util::MAX_BODY_ENV,
 };
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use bytes::Bytes;
-use futures::stream;
 use std::sync::Arc;
 use tower::ServiceExt;
 

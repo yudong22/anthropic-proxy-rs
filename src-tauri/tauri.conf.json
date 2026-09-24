@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Anthropic Proxy",
-  "version": "1.6.0",
-  "identifier": "com.anthropic-proxy.desktop",
+  "productName": "Proxy RS",
+  "version": "1.7.0",
+  "identifier": "com.proxy-rs.desktop",
   "build": {
     "frontendDist": "../ui"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Anthropic Proxy",
+        "title": "Proxy RS",
         "label": "main",
         "width": 920,
         "height": 660,
@@ -39,7 +39,7 @@
       "icons/icon.ico"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "Anthropic API proxy to OpenAI-compatible endpoints",
+    "shortDescription": "High-performance AI API proxy to OpenAI-compatible endpoints",
     "macOS": {
       "minimumSystemVersion": "10.15"
     }

@@ -182,7 +182,7 @@ is the single table both the response and the recorded row read.
 ## Module Layout
 
 ```
-src/                    ← the `anthropic_proxy` library (proxy core)
+src/                    ← the `proxy_rs` library (proxy core)
   models/
     mod.rs
     anthropic.rs        ← Layer 0

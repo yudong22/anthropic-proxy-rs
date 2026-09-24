@@ -118,7 +118,7 @@ fn build_model(id: &str, name: Option<&str>, context_window: Option<u64>) -> Cat
     CatalogModel {
         slug: id.to_string(),
         display_name: name.unwrap_or(id).to_string(),
-        description: format!("{} via anthropic-proxy-rs", name.unwrap_or(id)),
+        description: format!("{} via proxy-rs", name.unwrap_or(id)),
         // Codex requires instructions per model; the generic Codex prompt is the
         // safe default for third-party models.
         base_instructions: "You are Codex, a coding agent. You and the user share the same \

@@ -1,17 +1,17 @@
 [package]
-name = "anthropic-proxy"
-version = "1.6.0"
+name = "proxy-rs"
+version = "1.7.0"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
     "m0n0x41d (Ivan Zakutnii) <zakutnii.ivan@gmail.com>",
 ]
-description = "High-performance Anthropic API proxy to OpenAI-compatible endpoints"
+description = "High-performance AI protocol proxy (Anthropic Messages / OpenAI Responses & Chat) to OpenAI-compatible endpoints"
 license = "MIT"
 repository = "https://github.com/yudong22/anthropic-proxy-rs"
 
 [lib]
-name = "anthropic_proxy"
+name = "proxy_rs"
 path = "src/lib.rs"
 
 [workspace]

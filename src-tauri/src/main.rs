@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use anthropic_proxy::{
+use proxy_rs::{
     claude_config, codex_config, launch_agent, metrics, providers, router, service,
     settings::{self, GuiSettings, LogBuffer, DEFAULT_PORT},
     stats::RequestLogFilter,
@@ -53,9 +53,9 @@ fn update_tray_state(app: &tauri::AppHandle, ctx: &AppContext) {
             let _ = tray.set_icon_as_template(false);
         }
         let tooltip = if running {
-            format!("Anthropic Proxy · 运行中 (端口: {})", port)
+            format!("Proxy RS · 运行中 (端口: {})", port)
         } else {
-            "Anthropic Proxy · 已停止".to_string()
+            "Proxy RS · 已停止".to_string()
         };
         let _ = tray.set_tooltip(Some(tooltip));
     }
@@ -734,7 +734,7 @@ fn run_proxy_server(
             Err(e) => {
                 let in_use = e.kind() == std::io::ErrorKind::AddrInUse;
                 let hint = if in_use {
-                    "（端口已被占用：请先退出另一个 Anthropic Proxy 实例，或改用其它端口）"
+                    "（端口已被占用：请先退出另一个 Proxy RS 实例，或改用其它端口）"
                 } else {
                     ""
                 };

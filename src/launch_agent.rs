@@ -2,8 +2,8 @@ use anyhow::{bail, Result};
 use std::path::PathBuf;
 
 /// Manage a macOS LaunchAgent for "launch at login".
-/// Label: com.anthropic-proxy.gui
-const LABEL: &str = "com.anthropic-proxy.gui";
+/// Label: com.proxy-rs.gui
+const LABEL: &str = "com.proxy-rs.gui";
 
 pub fn plist_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -127,7 +127,7 @@ pub fn rewrite_plist_if_stale() -> Result<bool> {
     // history. Separate from proxy.log on purpose — see [`process_log_path`].
     let log_path = process_log_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/tmp/anthropic-proxy-process.log".to_string());
+        .unwrap_or_else(|| "/tmp/proxy-rs-process.log".to_string());
 
     let desired = plist_content(
         &exe.display().to_string(),
@@ -296,7 +296,7 @@ mod tests {
     fn gui_child_flag_is_recognised() {
         // The plist's exact argv, so the flag stays in sync with the plist.
         assert!(running_as_launchd_child(args(&[
-            "/Applications/Anthropic Proxy.app/Contents/MacOS/anthropic-proxy-gui",
+            "/Applications/Proxy RS.app/Contents/MacOS/proxy-rs-gui",
             "--gui-child"
         ])));
     }
@@ -304,11 +304,11 @@ mod tests {
     #[test]
     fn a_user_launch_is_not_mistaken_for_a_launchd_child() {
         assert!(!running_as_launchd_child(args(&[
-            "/Applications/Anthropic Proxy.app/Contents/MacOS/anthropic-proxy-gui"
+            "/Applications/Proxy RS.app/Contents/MacOS/proxy-rs-gui"
         ])));
         // macOS passes `-psn_…` when launching from Finder; it must not match.
         assert!(!running_as_launchd_child(args(&[
-            "/Applications/Anthropic Proxy.app/Contents/MacOS/anthropic-proxy-gui",
+            "/Applications/Proxy RS.app/Contents/MacOS/proxy-rs-gui",
             "-psn_0_12345"
         ])));
     }
@@ -421,14 +421,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("proxy-rs-plist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         // Include path characters that must be escaped, plus the real log path.
-        let path = dir.join("com.anthropic-proxy.gui.test.plist");
+        let path = dir.join("com.proxy-rs.gui.test.plist");
         std::fs::write(
             &path,
-            plist_content(
-                "/tmp/a&b/<weird>/anthropic-proxy-gui",
-                "/tmp/c\"d",
-                "/tmp/e'f.log",
-            ),
+            plist_content("/tmp/a&b/<weird>/proxy-rs-gui", "/tmp/c\"d", "/tmp/e'f.log"),
         )
         .expect("write plist");
 
