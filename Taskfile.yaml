@@ -24,11 +24,55 @@ tasks:
       - npm ci
 
   dev:
-    desc: Start the Tauri 2 GUI in development mode
+    desc: Start the Tauri 2 GUI in development mode, isolated from the installed app (port 3477)
     aliases: [gui-dev]
     deps: [setup]
     cmds:
-      - npm run dev
+      # A dev run must not fight the installed app. Three things are separated:
+      #
+      #   1. Data dir — otherwise it loads the same ~/.proxy-rs/gui-settings.json
+      #      (and its port) and writes request stats into the same stats.db.
+      #      ANTHROPIC_PROXY_DATA_DIR relocates settings, stats, logs and .env
+      #      together.
+      #   2. Single-instance socket — the plugin keys off the bundle identifier,
+      #      so npm run dev passes tauri.dev.conf.json to give this build its own
+      #      identifier. Without that, launching dev connects to the installed
+      #      app's socket, exits(0), and just focuses the installed window.
+      #   3. Window title / product name — so the two are told apart in the Dock
+      #      and menu bar.
+      #
+      # The settings file is written once and then left alone: edit
+      # ~/.proxy-rs-dev/gui-settings.json to change the port, or set
+      # ANTHROPIC_PROXY_DEV_PORT for the first run only.
+      - |
+        DEV_DIR="${ANTHROPIC_PROXY_DATA_DIR:-$HOME/.proxy-rs-dev}"
+        DEV_SETTINGS="$DEV_DIR/gui-settings.json"
+        mkdir -p "$DEV_DIR"
+
+        if [ ! -f "$DEV_SETTINGS" ]; then
+          PORT="${ANTHROPIC_PROXY_DEV_PORT:-3477}"
+          printf '%s\n' \
+            '{' \
+            '  "provider_id": "workbuddy-cn",' \
+            '  "custom_url": "",' \
+            '  "api_key": "",' \
+            "  \"port\": $PORT," \
+            '  "bind": "127.0.0.1",' \
+            '  "reasoning_model": "",' \
+            '  "completion_model": "",' \
+            '  "model_map": "",' \
+            '  "launch_at_login": false,' \
+            '  "sanitize_terms": ""' \
+            '}' > "$DEV_SETTINGS"
+          echo "🧪 Created $DEV_SETTINGS (port $PORT)"
+        fi
+
+        DEV_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$DEV_SETTINGS" | head -1)
+        echo "🧪 Dev data dir : $DEV_DIR"
+        echo "🧪 Dev console  : http://127.0.0.1:${DEV_PORT:-3477}"
+        echo "🧪 Installed app keeps $HOME/.proxy-rs untouched"
+        echo
+        ANTHROPIC_PROXY_DATA_DIR="$DEV_DIR" npm run dev
 
   build:
     desc: Build the Tauri 2 GUI desktop app (.app)

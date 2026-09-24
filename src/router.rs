@@ -12,8 +12,10 @@ use crate::proxy;
 use crate::service::ServiceController;
 use crate::settings::LogBuffer;
 use crate::stats::StatsDb;
+use crate::util;
 use crate::Config;
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Extension, Router,
 };
@@ -38,6 +40,13 @@ pub fn build_app_router(
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
+
+    // Claude Code's request bodies grow past 2 MB on a long conversation, which
+    // is axum's default cap for `Bytes`/`String`/`Json`. The handlers buffer the
+    // body themselves with the same figure (see `util::max_body_bytes`), so the
+    // two must agree: this layer is what bounds the *extractor*, and the handler
+    // is what bounds the peek and reports a 413 with the reason.
+    let max_body = util::max_body_bytes();
 
     Router::new()
         .route("/v1/messages", post(proxy::proxy_handler))
@@ -67,6 +76,7 @@ pub fn build_app_router(
                 async move { handle.render() }
             }),
         )
+        .layer(DefaultBodyLimit::max(max_body))
         .layer(Extension(service_ctrl))
         .layer(Extension(logs))
         .layer(Extension(config))

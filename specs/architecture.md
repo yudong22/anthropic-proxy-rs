@@ -144,6 +144,8 @@ Streaming request trace:
 
 ```
 proxy_handler(req)                                        [Layer 3: I/O]
+  → peeked = peek_json_body(req, max_body_bytes())        [Layer 3: bounded read]
+  → Json(req) = extract_or_reject(peeked, ...)            [Layer 3: typed extraction]
   → policy = translation_policy(&config)                  [Layer 2a]
   → openai_req = translate_request(req, &policy)          [Layer 2a]
       → model = select_model(req, &policy)                [Layer 2a: routing]
@@ -159,6 +161,23 @@ proxy_handler(req)                                        [Layer 3: I/O]
           → bytes = serialize_sse_event(event_type, event) [Layer 3: wire protocol]
           → yield bytes                                   [Layer 3: I/O]
 ```
+
+### Request-body contract
+
+Every JSON handler buffers the body twice — once in `peek_json_body` (the raw
+bytes are the only source for `metadata.user_id`, which the translation types
+deliberately drop) and once in the `Json` extractor. Both passes are bounded by
+the same figure, `util::max_body_bytes()`, which `router.rs` installs as axum's
+`DefaultBodyLimit` and the handlers pass to the peek. They must not diverge: a
+router limit below the peek's would reject in the extractor with a rejection the
+handler has already passed.
+
+A body that fails either pass is answered by `reject_request`, which records the
+outcome before returning. Rejections happen before the handler's own logging, so
+without it a rejected body leaves no trace in `proxy.log`, the GUI console or the
+stats DB. Statuses are preserved rather than flattened to 400 — 413 over the cap,
+400 unparseable, 415 wrong content type, 422 wrong shape — and `ProxyError::status`
+is the single table both the response and the recorded row read.
 
 ## Module Layout
 

@@ -1,12 +1,12 @@
 {
   "name": "proxy-rs",
-  "version": "1.5.3",
+  "version": "1.6.0",
   "private": true,
   "description": "Anthropic API 到 OpenAI 兼容端点的代理（Tauri 2 桌面应用 + Rust 代理核心）",
   "license": "MIT",
   "scripts": {
     "tauri": "tauri",
-    "dev": "tauri dev",
+    "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "build": "tauri build -b app",
     "build:dmg": "tauri build -b dmg"
   },

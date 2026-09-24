@@ -6,7 +6,7 @@ use crate::service;
 use crate::session::{self, ClientKind, SessionInfo};
 use crate::stats::{RequestOutcome, StatsDb, TokenRecord};
 use crate::translate::{pipeline, responses as responses_pipeline, stream};
-use crate::util::{format_headers, peek_json_body, truncate};
+use crate::util::{self, format_headers, truncate};
 use axum::{
     body::Body,
     extract::{FromRequest, Request},
@@ -68,18 +68,27 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     request: Request,
 ) -> ProxyResult<Response> {
+    let start = Instant::now();
     // Resolve the session before the body is consumed by `Json`. The raw bytes
     // are parsed because the translation type deliberately drops
     // `metadata.user_id` — the only session id Claude Code sends.
-    let (raw_body, request) = peek_json_body(request).await;
-    let session = resolve_session(&headers, raw_body.as_ref());
+    let limit = util::max_body_bytes();
+    let peeked = util::peek_json_body(request, limit).await;
+    let session = resolve_session(&headers, peeked.json.as_ref());
     let tag = session.log_tag();
-    let Json(req): Json<anthropic::AnthropicRequest> = Json::from_request(request, &())
-        .await
-        .map_err(|e| ProxyError::Transform(e.to_string()))?;
+
+    let Json(req): Json<anthropic::AnthropicRequest> = extract_or_reject(
+        peeked,
+        "/v1/messages",
+        &gui_logs,
+        &stats,
+        &session,
+        &tag,
+        start,
+    )
+    .await?;
 
     let is_streaming = req.stream.unwrap_or(false);
-    let start = Instant::now();
 
     let incoming_headers = format_headers(&headers);
     gui_logs
@@ -199,15 +208,24 @@ pub async fn responses_proxy_handler(
     headers: HeaderMap,
     request: Request,
 ) -> ProxyResult<Response> {
-    let (raw_body, request) = peek_json_body(request).await;
-    let session = resolve_session(&headers, raw_body.as_ref());
+    let start = Instant::now();
+    let limit = util::max_body_bytes();
+    let peeked = util::peek_json_body(request, limit).await;
+    let session = resolve_session(&headers, peeked.json.as_ref());
     let tag = session.log_tag();
-    let Json(req): Json<responses::ResponsesRequest> = Json::from_request(request, &())
-        .await
-        .map_err(|e| ProxyError::Transform(e.to_string()))?;
+
+    let Json(req): Json<responses::ResponsesRequest> = extract_or_reject(
+        peeked,
+        "/v1/responses",
+        &gui_logs,
+        &stats,
+        &session,
+        &tag,
+        start,
+    )
+    .await?;
 
     let is_streaming = req.stream.unwrap_or(false);
-    let start = Instant::now();
 
     let incoming_headers = format_headers(&headers);
     gui_logs
@@ -322,15 +340,24 @@ pub async fn chat_completions_proxy_handler(
     headers: HeaderMap,
     request: Request,
 ) -> ProxyResult<Response> {
-    let (raw_body, request) = peek_json_body(request).await;
-    let session = resolve_session(&headers, raw_body.as_ref());
+    let start = Instant::now();
+    let limit = util::max_body_bytes();
+    let peeked = util::peek_json_body(request, limit).await;
+    let session = resolve_session(&headers, peeked.json.as_ref());
     let tag = session.log_tag();
-    let Json(mut req): Json<openai::OpenAIRequest> = Json::from_request(request, &())
-        .await
-        .map_err(|e| ProxyError::Transform(e.to_string()))?;
+
+    let Json(mut req): Json<openai::OpenAIRequest> = extract_or_reject(
+        peeked,
+        "/v1/chat/completions",
+        &gui_logs,
+        &stats,
+        &session,
+        &tag,
+        start,
+    )
+    .await?;
 
     let is_streaming = req.stream.unwrap_or(false);
-    let start = Instant::now();
 
     let incoming_headers = format_headers(&headers);
     gui_logs
@@ -436,6 +463,109 @@ pub async fn chat_completions_proxy_handler(
     result
 }
 
+/// Extract the typed request from a peeked body, recording any rejection.
+///
+/// One entry point for both early failure modes, so neither can regress into an
+/// unlogged `?`:
+///
+///   * the body never buffered (`peeked.error`) — a 413 over the cap, or a 400
+///     for a read that failed. Answered directly, because handing the emptied
+///     request to the extractor would replace the real cause with a misleading
+///     "invalid JSON";
+///   * the body buffered but `Json` rejected it — the rejection's own status is
+///     preserved (400 unparseable, 415 wrong content-type, 422 shape mismatch)
+///     instead of being flattened to a generic 400.
+///
+/// `route` is the one that handler serves, so a client talking to three APIs on
+/// one port can tell which one refused it.
+async fn extract_or_reject<T>(
+    peeked: util::PeekedBody,
+    route: &str,
+    gui_logs: &Arc<crate::settings::LogBuffer>,
+    stats: &Arc<StatsDb>,
+    session: &SessionInfo,
+    tag: &str,
+    start: Instant,
+) -> ProxyResult<Json<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if let Some(body_error) = &peeked.error {
+        let (status, message) = body_error.parts();
+        return Err(reject_request(
+            ProxyError::Rejected { status, message },
+            gui_logs,
+            stats,
+            route,
+            session,
+            tag,
+            start,
+        )
+        .await);
+    }
+
+    match Json::from_request(peeked.request, &()).await {
+        Ok(json) => Ok(json),
+        Err(rejection) => {
+            let error = util::rejection_error(route, &rejection);
+            Err(reject_request(error, gui_logs, stats, route, session, tag, start).await)
+        }
+    }
+}
+
+/// Record a request rejected before translation, and return the error to send.
+///
+/// Both early exits call this — a body that could not be buffered, and a body
+/// that buffered but failed typed extraction. They run before the service-state
+/// check and before the header log line, so recording here is the only thing
+/// that makes them visible: previously they returned through `?` with no entry
+/// in `proxy.log`, the in-memory console or the stats DB. That is exactly how a
+/// 400 "Failed to buffer the request body" reached a user with nothing on the
+/// proxy side to explain it.
+///
+/// The gauge is deliberately untouched: `InFlightGuard` is created later in the
+/// handler, so there is nothing here to balance.
+///
+/// `model` is unknown at this point — the body never yielded one — so the row
+/// carries an empty model rather than a guess.
+async fn reject_request(
+    error: ProxyError,
+    gui_logs: &Arc<crate::settings::LogBuffer>,
+    stats: &Arc<StatsDb>,
+    route: &str,
+    session: &SessionInfo,
+    tag: &str,
+    start: Instant,
+) -> ProxyError {
+    let status = error.status().as_u16();
+    let message = error.to_string();
+    let duration_ms = start.elapsed().as_millis() as i64;
+
+    let _ = stats.record_request_log(RequestOutcome {
+        model: "",
+        route,
+        tokens: &TokenRecord::default(),
+        duration_ms,
+        streamed: false,
+        status,
+        error: Some(&message),
+        session_id: &session.session_id,
+        client: session.client.tag(),
+    });
+    gui_logs
+        .push(
+            "ERROR",
+            format!(
+                "POST {} rejected {}ms {} | {}",
+                route, duration_ms, tag, message
+            ),
+        )
+        .await;
+    tracing::warn!("POST {} rejected: {} ({})", route, message, tag);
+
+    error
+}
+
 /// Resolve the session identity of an incoming request.
 ///
 /// Header sources are read first (they are the only ones available on
@@ -452,17 +582,14 @@ fn resolve_session(headers: &HeaderMap, body: Option<&serde_json::Value>) -> Ses
     session::merge(session::detect(headers), body_info)
 }
 
-/// HTTP status to report for a completed request (500 when it errored).
+/// HTTP status to report for a completed request.
+///
+/// Delegates to [`ProxyError::status`] so the log row and the response cannot
+/// disagree; keeping a second table here is what let a 413 be recorded as a 400.
 fn outcome_status(result: &ProxyResult<Response>) -> u16 {
     match result {
         Ok(resp) => resp.status().as_u16(),
-        Err(err) => match err {
-            ProxyError::Config(_) => 500,
-            ProxyError::Transform(_) => 400,
-            ProxyError::Upstream(_) => 502,
-            ProxyError::Serialization(_) => 400,
-            ProxyError::Http(_) => 502,
-        },
+        Err(err) => err.status().as_u16(),
     }
 }
 

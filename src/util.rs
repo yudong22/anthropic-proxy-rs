@@ -1,9 +1,11 @@
 //! Small shared helpers used across the proxy, stats and credits modules.
 
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     http::{HeaderMap, Request},
 };
+use bytes::Bytes;
+use futures::stream::StreamExt;
 
 /// Truncate `text` to at most `max` characters, appending an ellipsis when cut.
 ///
@@ -122,6 +124,84 @@ fn redact_header_value(name: &str, value: &str) -> String {
     }
 }
 
+/// Default cap on the request body the proxy will buffer, in bytes (32 MiB).
+///
+/// The figure is a memory guard, not an API limit: Claude Code's own request
+/// bodies already reach ~2 MB on a long session, so axum's 2 MB default rejects
+/// legitimate traffic. 32 MiB leaves an order of magnitude of headroom while
+/// still bounding what one request can pin.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Environment override for [`DEFAULT_MAX_BODY_BYTES`], in bytes.
+pub const MAX_BODY_ENV: &str = "ANTHROPIC_PROXY_MAX_BODY_BYTES";
+
+/// The configured body cap, read from the environment on each call.
+///
+/// A blank, non-numeric or zero value falls back to the default rather than
+/// disabling the limit: an unparseable override must not become "unlimited".
+pub fn max_body_bytes() -> usize {
+    std::env::var(MAX_BODY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES)
+}
+
+/// Render a byte count for an error message (`2 MiB`, `512 KiB`, `300 bytes`).
+pub fn human_bytes(n: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if n >= MIB && n.is_multiple_of(MIB) {
+        format!("{} MiB", n / MIB)
+    } else if n >= KIB && n.is_multiple_of(KIB) {
+        format!("{} KiB", n / KIB)
+    } else {
+        format!("{n} bytes")
+    }
+}
+
+/// Why a request body could not be buffered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyError {
+    /// The body was larger than the configured cap.
+    TooLarge { limit: usize },
+    /// The body could not be read at all (client disconnect, reset stream, …).
+    Io(String),
+}
+
+impl BodyError {
+    /// The status and message the client is told.
+    pub fn parts(&self) -> (u16, String) {
+        match self {
+            BodyError::TooLarge { limit } => (
+                413,
+                format!(
+                    "request body exceeds the {} limit (raise {MAX_BODY_ENV} to allow larger bodies)",
+                    human_bytes(*limit)
+                ),
+            ),
+            BodyError::Io(detail) => (
+                400,
+                format!("could not read the request body: {detail}"),
+            ),
+        }
+    }
+}
+
+/// A buffered request body: what it parsed to, whether it buffered at all, and
+/// the request handed back for the next consumer.
+///
+/// `json` is a *logging* aid — the typed extraction that follows is what
+/// validates the payload — so a parse failure here is not itself an error. Only
+/// [`BodyError`] means the body never arrived, and that must be answered rather
+/// than passed on: re-reading a body that already failed would report a
+/// misleading "invalid JSON" instead of what actually went wrong.
+pub struct PeekedBody {
+    pub json: Option<serde_json::Value>,
+    pub error: Option<BodyError>,
+    pub request: Request<Body>,
+}
+
 /// Parse a JSON body from the exact bytes the client sent.
 ///
 /// Used at the top of a handler, before `Json<T>` consumes the body: `T` is the
@@ -131,16 +211,76 @@ fn redact_header_value(name: &str, value: &str) -> String {
 /// bytes keeps that information without widening a translation type for what is
 /// purely a logging concern.
 ///
-/// Returns `None` on any problem — a non-JSON body, a body that will not buffer
-/// — so a caller can treat a logging aid as strictly optional. The extracted
-/// [`Request`] is handed back for `Json` to re-consume.
-pub async fn peek_json_body(req: Request<Body>) -> (Option<serde_json::Value>, Request<Body>) {
+/// `limit` bounds what is buffered here as well as what the extractor accepts
+/// (the router installs the same value as axum's `DefaultBodyLimit`), so a body
+/// over the cap is rejected once, with a status and message this proxy chose,
+/// instead of being read into memory unbounded and then failing in the extractor.
+pub async fn peek_json_body(req: Request<Body>, limit: usize) -> PeekedBody {
     let (parts, body) = req.into_parts();
-    let Ok(bytes) = to_bytes(body, usize::MAX).await else {
-        return (None, Request::from_parts(parts, Body::empty()));
-    };
-    let parsed = serde_json::from_slice(&bytes).ok();
-    (parsed, Request::from_parts(parts, Body::from(bytes)))
+    match collect_bounded(body, limit).await {
+        Ok(bytes) => {
+            // A non-JSON body is not fatal here: `Json` reports it with a far
+            // better message than this peek could, so the error is dropped.
+            let json = serde_json::from_slice(&bytes).ok();
+            PeekedBody {
+                json,
+                error: None,
+                request: Request::from_parts(parts, Body::from(bytes)),
+            }
+        }
+        Err(error) => PeekedBody {
+            json: None,
+            error: Some(error),
+            request: Request::from_parts(parts, Body::empty()),
+        },
+    }
+}
+
+/// Read a body, refusing to buffer more than `limit` bytes.
+///
+/// Written out rather than delegated to `axum::body::to_bytes` for two reasons:
+/// the failure mode has to be distinguishable (an over-limit body is a 413, a
+/// dropped connection is not), and `to_bytes` reports both as one opaque error
+/// whose length-limit variant lives in a crate this one does not depend on.
+/// Counting here keeps the distinction explicit and local.
+///
+/// The limit is checked against the *sum* accumulated so far, not per frame: a
+/// chunked body arrives in arbitrary pieces, so a per-frame check would pass a
+/// body of any size as long as every individual frame stayed small.
+async fn collect_bounded(body: Body, limit: usize) -> Result<Bytes, BodyError> {
+    let mut stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(frame) = stream.next().await {
+        let frame = frame.map_err(|e| BodyError::Io(e.to_string()))?;
+        if buf.len() + frame.len() > limit {
+            return Err(BodyError::TooLarge { limit });
+        }
+        buf.extend_from_slice(&frame);
+    }
+
+    Ok(Bytes::from(buf))
+}
+
+/// Turn a failed typed extraction into an error that keeps its real status.
+///
+/// The rejection already carries the right code — 400 for unparseable JSON, 415
+/// for a wrong `content-type`, 422 for a shape mismatch — so it is preserved
+/// rather than funnelled into a generic 400. The route is named because three
+/// different APIs share one port and the client should not have to guess which
+/// one refused it.
+pub fn rejection_error(
+    route: &str,
+    rejection: &axum::extract::rejection::JsonRejection,
+) -> crate::error::ProxyError {
+    crate::error::ProxyError::Rejected {
+        status: rejection.status().as_u16(),
+        message: format!(
+            "invalid {route} request: {} (HTTP {})",
+            rejection.body_text(),
+            rejection.status().as_u16()
+        ),
+    }
 }
 
 /// Convert days since the Unix epoch to a `(year, month, day)` civil date.
@@ -390,5 +530,112 @@ mod tests {
     fn format_epoch_secs_renders_utc_components() {
         assert_eq!(format_epoch_secs(0), "1970-01-01 00:00:00");
         assert_eq!(format_epoch_secs(86_400 + 3661), "1970-01-02 01:01:01");
+    }
+
+    #[test]
+    fn human_bytes_picks_a_readable_unit() {
+        assert_eq!(human_bytes(512), "512 bytes");
+        assert_eq!(human_bytes(4 * 1024), "4 KiB");
+        assert_eq!(human_bytes(32 * 1024 * 1024), "32 MiB");
+        // A non-round figure keeps the exact byte count rather than rounding to
+        // a unit and hiding what the limit actually is.
+        assert_eq!(human_bytes(4096 + 1), "4097 bytes");
+    }
+
+    /// Serialises the tests that touch the process-global body cap.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The cap must never silently become "unlimited": an editor writing a blank
+    /// or junk value is the realistic way that happens.
+    #[test]
+    fn max_body_bytes_falls_back_on_bad_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        for bad in ["", "  ", "0", "not-a-number", "-1"] {
+            std::env::set_var(MAX_BODY_ENV, bad);
+            assert_eq!(
+                max_body_bytes(),
+                DEFAULT_MAX_BODY_BYTES,
+                "{bad:?} must fall back to the default"
+            );
+        }
+
+        std::env::set_var(MAX_BODY_ENV, " 65536 ");
+        assert_eq!(max_body_bytes(), 65536, "a padded number is still honoured");
+
+        std::env::remove_var(MAX_BODY_ENV);
+        assert_eq!(max_body_bytes(), DEFAULT_MAX_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn collect_bounded_accepts_a_body_exactly_at_the_limit() {
+        let bytes = collect_bounded(Body::from(vec![b'a'; 64]), 64)
+            .await
+            .expect("a body equal to the limit is allowed");
+        assert_eq!(bytes.len(), 64);
+    }
+
+    /// The limit is a total, not a per-frame rule: a body split into small
+    /// frames must still be refused once their sum passes it.
+    #[tokio::test]
+    async fn collect_bounded_counts_across_frames() {
+        let frames: Vec<Result<Bytes, std::io::Error>> = (0..8)
+            .map(|_| Ok(Bytes::from_static(&[b'x'; 16])))
+            .collect();
+        let body = Body::from_stream(futures::stream::iter(frames));
+
+        // 8 frames x 16 bytes = 128, against a 64-byte cap. Each frame is well
+        // under the limit on its own.
+        let err = collect_bounded(body, 64)
+            .await
+            .expect_err("the sum must be what is bounded");
+        assert_eq!(err, BodyError::TooLarge { limit: 64 });
+    }
+
+    #[tokio::test]
+    async fn collect_bounded_reports_a_read_failure_as_io() {
+        let body = Body::from_stream(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "gone"),
+        )]));
+
+        let err = collect_bounded(body, 1024)
+            .await
+            .expect_err("a failed read is an error");
+        assert!(matches!(err, BodyError::Io(_)), "got {err:?}");
+        assert_eq!(err.parts().0, 400, "a failed read is not a size problem");
+    }
+
+    #[tokio::test]
+    async fn peek_hands_the_bytes_back_to_the_next_consumer() {
+        let body = serde_json::json!({"model": "m", "messages": []}).to_string();
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+
+        let peeked = peek_json_body(request, 1024).await;
+
+        assert!(peeked.error.is_none());
+        assert_eq!(peeked.json.unwrap()["model"], "m");
+        // The extractor downstream must still see the original body.
+        let rest = axum::body::to_bytes(peeked.request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&rest), body);
+    }
+
+    /// A body that fails to buffer is not silently turned into an empty one:
+    /// the caller has to notice `error` and answer it.
+    #[tokio::test]
+    async fn peek_marks_an_oversized_body_and_does_not_guess_at_json() {
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; 2048]))
+            .unwrap();
+
+        let peeked = peek_json_body(request, 128).await;
+
+        assert_eq!(peeked.error, Some(BodyError::TooLarge { limit: 128 }));
+        assert!(peeked.json.is_none(), "an unbuffered body cannot be parsed");
     }
 }

@@ -15,6 +15,17 @@ pub enum ProxyError {
     #[error("Request transformation error: {0}")]
     Transform(String),
 
+    /// A request rejected before translation, carrying the HTTP status the
+    /// client must see.
+    ///
+    /// [`ProxyError::Transform`] cannot stand in for this: it always answers
+    /// 400, while the rejections it would otherwise swallow distinguish 400
+    /// (unparseable body) from 413 (body over the limit) and 415 (wrong content
+    /// type). Collapsing all three into 400 is what made a body-limit failure
+    /// look like a malformed request.
+    #[error("{message}")]
+    Rejected { status: u16, message: String },
+
     #[error("Upstream API error: {0}")]
     Upstream(String),
 
@@ -25,16 +36,35 @@ pub enum ProxyError {
     Http(#[from] reqwest::Error),
 }
 
+impl ProxyError {
+    /// The HTTP status this error is reported with.
+    ///
+    /// Single source of truth for both the response and the log row, so the two
+    /// cannot disagree about what the client was told.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            ProxyError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::Transform(_) => StatusCode::BAD_REQUEST,
+            ProxyError::Rejected { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
+            }
+            ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            ProxyError::Serialization(_) => StatusCode::BAD_REQUEST,
+            ProxyError::Http(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, error_message) = match self {
-            ProxyError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            ProxyError::Transform(msg) => (StatusCode::BAD_REQUEST, msg),
-            ProxyError::Upstream(msg) => (StatusCode::BAD_GATEWAY, msg),
-            ProxyError::Serialization(err) => {
-                (StatusCode::BAD_REQUEST, format!("JSON error: {}", err))
-            }
-            ProxyError::Http(err) => (StatusCode::BAD_GATEWAY, format!("HTTP error: {}", err)),
+        let status = self.status();
+        let error_message = match &self {
+            ProxyError::Config(msg) => msg.clone(),
+            ProxyError::Transform(msg) => msg.clone(),
+            ProxyError::Rejected { message, .. } => message.clone(),
+            ProxyError::Upstream(msg) => msg.clone(),
+            ProxyError::Serialization(err) => format!("JSON error: {}", err),
+            ProxyError::Http(err) => format!("HTTP error: {}", err),
         };
 
         let body = Json(json!({
@@ -92,5 +122,64 @@ mod tests {
             status_of(ProxyError::Serialization(err)),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// A rejection carries its own status through to the response, which is what
+    /// keeps a 413 or a 415 from being flattened into a generic 400.
+    #[test]
+    fn rejected_error_keeps_the_status_it_was_given() {
+        for status in [400u16, 413, 415, 422] {
+            assert_eq!(
+                status_of(ProxyError::Rejected {
+                    status,
+                    message: "nope".into(),
+                }),
+                StatusCode::from_u16(status).unwrap(),
+                "status {status} must survive"
+            );
+        }
+    }
+
+    /// `outcome_status` reads the same table, so the log row and the response
+    /// cannot disagree — the mismatch is what made a 413 look like a 400.
+    #[test]
+    fn status_is_shared_by_the_response_and_the_log_row() {
+        let error = ProxyError::Rejected {
+            status: 413,
+            message: "too big".into(),
+        };
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error.status(),
+            status_of(ProxyError::Rejected {
+                status: 413,
+                message: "too big".into(),
+            })
+        );
+    }
+
+    /// A code outside the valid range must not panic or produce a nonsense
+    /// response: 400 is the fallback. (Note the http crate accepts 100–999, so
+    /// this has to be a value beyond that, not merely an unassigned one.)
+    #[test]
+    fn an_invalid_status_code_degrades_to_400() {
+        assert_eq!(
+            status_of(ProxyError::Rejected {
+                status: 1000,
+                message: "bogus".into(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn rejected_error_message_reaches_the_body() {
+        let response = ProxyError::Rejected {
+            status: 413,
+            message: "request body exceeds the 32 MiB limit".into(),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

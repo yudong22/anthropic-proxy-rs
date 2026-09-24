@@ -168,14 +168,47 @@ impl Default for GuiSettings {
 }
 
 /// Canonical data directory: `~/.proxy-rs`.
+///
+/// [`DATA_DIR_ENV`] relocates the whole directory — settings, `stats.db`,
+/// `logs/` and `.env` together — which is what keeps a development run from
+/// writing request statistics into the installed app's database.
 pub fn data_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home).join(".proxy-rs");
+    let dir = match env_data_dir() {
+        Some(dir) => dir,
+        None => {
+            let home = std::env::var("HOME").ok()?;
+            PathBuf::from(home).join(".proxy-rs")
+        }
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
+/// Override the data directory, for a second instance that must not share
+/// state with the installed app. `task dev` points this at `~/.proxy-rs-dev`.
+const DATA_DIR_ENV: &str = "ANTHROPIC_PROXY_DATA_DIR";
+
+/// The [`DATA_DIR_ENV`] override, `~` expanded. `None` when unset or blank.
+fn env_data_dir() -> Option<PathBuf> {
+    let raw = std::env::var(DATA_DIR_ENV).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.strip_prefix("~/") {
+        Some(rest) => {
+            let home = std::env::var("HOME").ok()?;
+            Some(PathBuf::from(home).join(rest))
+        }
+        None => Some(PathBuf::from(raw)),
+    }
+}
+
 /// Stable settings path: `~/.proxy-rs/gui-settings.json`.
+///
+/// Relocating the file is done by relocating [`data_dir`], not by a second
+/// override here: one knob keeps settings, `stats.db`, `logs/` and `.env`
+/// together, so a second instance can never end up half-isolated.
 pub fn settings_path() -> PathBuf {
     if let Some(dir) = data_dir() {
         return dir.join("gui-settings.json");
@@ -518,6 +551,98 @@ mod tests {
             normalize_chat_url("https://copilot.tencent.com/v2/chat/completions"),
             "https://copilot.tencent.com/v2/chat/completions"
         );
+    }
+
+    /// The data-directory override is process-global, so tests that set it must
+    /// not run concurrently with each other.
+    static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` with `ANTHROPIC_PROXY_DATA_DIR` set to `value`, then restore
+    /// whatever was there. Returns the guard so the caller keeps exclusivity.
+    ///
+    /// Env vars are process-wide, so a leaked value would change what every
+    /// other test — and any `data_dir()` call in this one — resolves to.
+    fn with_data_dir_env(
+        value: Option<&str>,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        Option<std::ffi::OsString>,
+    ) {
+        let guard = DATA_DIR_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os(DATA_DIR_ENV);
+        match value {
+            Some(v) => std::env::set_var(DATA_DIR_ENV, v),
+            None => std::env::remove_var(DATA_DIR_ENV),
+        }
+        (guard, previous)
+    }
+
+    fn restore_data_dir_env(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(v) => std::env::set_var(DATA_DIR_ENV, v),
+            None => std::env::remove_var(DATA_DIR_ENV),
+        }
+    }
+
+    /// The whole point of the override: settings, stats and logs move together.
+    #[test]
+    fn data_dir_env_relocates_the_whole_directory() {
+        let (_guard, previous) = with_data_dir_env(Some("~/.proxy-rs-test-settings"));
+
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            data_dir().unwrap(),
+            PathBuf::from(&home).join(".proxy-rs-test-settings")
+        );
+        // settings_path and dotenv_path both derive from data_dir, so they must
+        // follow it rather than pointing back at the shared ~/.proxy-rs.
+        assert_eq!(
+            settings_path(),
+            PathBuf::from(&home).join(".proxy-rs-test-settings/gui-settings.json")
+        );
+        assert_eq!(
+            dotenv_path().unwrap(),
+            PathBuf::from(&home).join(".proxy-rs-test-settings/.env")
+        );
+        assert_eq!(
+            log_dir().unwrap(),
+            PathBuf::from(&home).join(".proxy-rs-test-settings/logs")
+        );
+
+        restore_data_dir_env(previous);
+    }
+
+    /// An absolute path is used as given, without HOME expansion.
+    #[test]
+    fn data_dir_env_accepts_an_absolute_path() {
+        let (_guard, previous) = with_data_dir_env(Some("/tmp/proxy-rs-abs"));
+
+        assert_eq!(data_dir().unwrap(), PathBuf::from("/tmp/proxy-rs-abs"));
+
+        restore_data_dir_env(previous);
+    }
+
+    /// Unset (and blank) must fall back to the default, so an exported-but-empty
+    /// variable cannot silently relocate the app's state.
+    #[test]
+    fn blank_data_dir_env_falls_back_to_default() {
+        let (_guard, previous) = with_data_dir_env(Some("   "));
+
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(data_dir().unwrap(), PathBuf::from(&home).join(".proxy-rs"));
+
+        restore_data_dir_env(previous);
+    }
+
+    /// Without the override the default location is unchanged.
+    #[test]
+    fn unset_data_dir_env_uses_default() {
+        let (_guard, previous) = with_data_dir_env(None);
+
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(data_dir().unwrap(), PathBuf::from(&home).join(".proxy-rs"));
+
+        restore_data_dir_env(previous);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::sync::{atomic::AtomicU16, Arc};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, State,
+    Emitter, Manager, State,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -75,6 +75,16 @@ fn update_tray_state(app: &tauri::AppHandle, ctx: &AppContext) {
     }
 }
 
+/// Tell the console the service state changed.
+///
+/// Replaces the UI's 2-second `get_status` poll: the front-end listens for
+/// `service-state` and re-reads status only when this fires. Every caller
+/// already calls `update_tray_state` at the same moment — the tray and the
+/// console show the same fact — so the two are kept adjacent deliberately.
+fn emit_service_state(app: &tauri::AppHandle) {
+    let _ = app.emit("service-state", ());
+}
+
 #[tauri::command]
 async fn get_status(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let settings = ctx.settings.read().await;
@@ -106,6 +116,11 @@ async fn get_status(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
         "data_dir": settings::data_dir().map(|d| d.display().to_string()),
         "env_path": settings::dotenv_path().map(|p| p.display().to_string()),
         "log_path": settings::log_file_path().map(|p| p.display().to_string()),
+        // A debug build (what `tauri dev` produces) shares the installed app's
+        // launchd label, so letting it write the login item would point the
+        // user's next login at a development binary. The console disables the
+        // switch on this flag.
+        "is_dev": cfg!(debug_assertions),
     }))
 }
 
@@ -139,6 +154,7 @@ async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
 fn request_start(app: tauri::AppHandle, ctx: Arc<AppContext>) {
     start_proxy_server(app.clone(), ctx.clone());
     update_tray_state(&app, &ctx);
+    emit_service_state(&app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval("if (window.refreshStatus) { window.refreshStatus(); }");
     }
@@ -151,6 +167,7 @@ fn request_start(app: tauri::AppHandle, ctx: Arc<AppContext>) {
 fn request_stop(app: tauri::AppHandle, ctx: Arc<AppContext>) {
     stop_proxy_server(ctx.clone());
     update_tray_state(&app, &ctx);
+    emit_service_state(&app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval("if (window.refreshStatus) { window.refreshStatus(); }");
     }
@@ -685,6 +702,7 @@ fn run_proxy_server(
                 ctx.logs.push("ERROR", format!("代理配置无效: {}", e)).await;
                 ctx.service_ctrl.mark_stopped();
                 update_tray_state(&app, &ctx);
+                emit_service_state(&app);
                 return;
             }
         };
@@ -728,6 +746,7 @@ fn run_proxy_server(
                     .await;
                 ctx.service_ctrl.mark_stopped();
                 update_tray_state(&app, &ctx);
+                emit_service_state(&app);
                 return;
             }
         };
@@ -742,6 +761,7 @@ fn run_proxy_server(
             .store(bound_port, std::sync::atomic::Ordering::SeqCst);
         ctx.service_ctrl.mark_running();
         update_tray_state(&app, &ctx);
+        emit_service_state(&app);
         ctx.logs
             .push(
                 "INFO",
@@ -762,6 +782,7 @@ fn run_proxy_server(
         if ctx.server_epoch.load(std::sync::atomic::Ordering::SeqCst) == server_id {
             ctx.service_ctrl.mark_stopped();
             update_tray_state(&app, &ctx);
+            emit_service_state(&app);
         }
     });
 }

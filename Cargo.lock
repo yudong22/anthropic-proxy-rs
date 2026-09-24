@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "anthropic-proxy"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "anthropic-proxy-gui"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "anthropic-proxy",
  "anyhow",

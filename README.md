@@ -196,9 +196,14 @@ ANTHROPIC_BASE_URL=http://localhost:3456 claude
 | `REASONING_MODEL` | 否 | 用请求模型 | 开启思考时使用的模型 |
 | `COMPLETION_MODEL` | 否 | 用请求模型 | 普通请求使用的模型 |
 | `CREDITS_API_ENDPOINT` | 否 | - | `/v1/credits` 的网关额度端点 |
+| `ANTHROPIC_PROXY_MAX_BODY_BYTES` | 否 | `33554432`（32 MiB） | 请求体上限（字节）。超出返回 `413` |
 | `DEBUG` / `VERBOSE` | 否 | `false` | 调试日志 / 完整请求响应体日志 |
 
 \* 上游需要鉴权时必填。`UPSTREAM_API_KEY_PASSTHROUGH=true` 与 `UPSTREAM_API_KEY` 互斥，同时设置会拒绝启动。
+
+请求体上限说明：长会话的 Claude Code 请求体可以超过 2 MB，因此默认放宽到 32 MiB。超限时返回 `413`
+并说明当前上限与调整方式；请求体本身读失败（客户端中断连接）返回 `400`。两种情况都会写入
+`proxy.log`、GUI 控制台与请求统计，不会静默消失。
 
 `UPSTREAM_BASE_URL` 支持三种形式：
 
